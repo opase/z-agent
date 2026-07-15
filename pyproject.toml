@@ -1,0 +1,46 @@
+[project]
+name = "Zagent"
+version = "2.0.0"
+description = "基于 LangGraph 的 Agentic RAG 引擎，支持 ReAct / Plan-and-Execute / Multi-Agent 三种执行模式，集成 MCP 工具协议与人机回圈审批"
+requires-python = ">=3.12"
+authors = [
+    {name = "opase"},
+]
+urls = {repository = "https://github.com/opase/Z-Agent"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.136.0",
+    "uvicorn[standard]>=0.46.0",
+    "langchain>=1.2.0",
+    "langchain-chroma>=1.0.0",
+    "langchain-community>=0.4.0",
+    "langchain-text-splitters>=1.0.0",
+    "langgraph>=0.2.0",
+    "chromadb>=0.5.0",
+    "dashscope>=1.25.0",
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
+    "pydantic>=2.12.0",
+    "python-multipart>=0.0.20",
+    "prometheus-client>=0.21.0",
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    "pyyaml>=6.0",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+    "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,26 @@
+fastapi>=0.136.0
+uvicorn>=0.46.0
+pydantic>=2.12.0
+langchain>=1.2.0
+langchain-core>=1.2.0
+langchain-community>=0.4.0
+langchain-chroma>=1.0.0
+langchain-text-splitters>=1.1.0
+langgraph>=0.2.0
+chromadb>=0.5.0
+dashscope>=1.25.0
+python-multipart>=0.0.27
+rank-bm25>=0.2.2
+jieba>=0.42.1
+mcp>=1.0.0
+prometheus_fastapi_instrumentator>=7.0.0
+prometheus_client>=0.21.0
+pyyaml>=6.0
+# ===== 可选：文档解析增强（取消注释以启用 PDF/DOCX/PPTX 导入）=====
+# 本地模式（需 GPU）: uv pip install "mineru[all]"
+# 云端模式（免 GPU）: pip install mineru-open-sdk + 设置 MINERU_METHOD=api-flash 或 api-precision
+# mineru[all]>=1.0.0
+# mineru-open-sdk
+# ===== 可选：RAGAS 标准化评估（取消注释以启用 ContextPrecision/Recall 等指标）=====
+# 安装方式: pip install ragas
+# ragas>=0.4.0

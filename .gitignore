@@ -1,0 +1,57 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 密钥 / 私有配置（勿入库）=====
+.env
+*.env
+config/mcp_config_real.yaml
+
+# ===== 运行时数据 / 生成物 =====
+.chroma_db/
+data/user_memory/
+data/conversations/
+data/md5.text
+data/sessions.db
+data/*.db
+data/*.db-shm
+data/*.db-wal
+eval_report_*.json
+*.jsonl
+*.sqlite3
+hello/
+
+# ===== 前端 (Node) =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/package-lock.json
+*.tsbuildinfo
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== Claude / 工具 =====
+.claude/
+.hermes/
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db

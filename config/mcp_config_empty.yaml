@@ -1,0 +1,6 @@
+# 空 MCP 配置（用于测试 Phase 2 功能，避免启动卡在 npx 下载）
+servers: []
+settings:
+  approval_timeout_minutes: 5
+  max_tools_per_server: 20
+  max_servers: 10

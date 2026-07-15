@@ -1,0 +1,24 @@
+# MCP 服务器配置列表
+# 每个服务器可配置：传输类型、连接参数、审批策略
+
+servers:
+  - name: filesystem
+    transport: stdio
+    command: ["npx.cmd", "-y", "@modelcontextprotocol/server-filesystem", "."]
+    approval_mode: require_approval
+    tool_overrides:
+      read_file: auto_approve
+      list_allowed_directories: auto_approve
+  # 示例 HTTP 配置:
+  # - name: web_search
+  #   transport: http
+  #   url: "http://localhost:3001/mcp"
+  #   headers:
+  #     Authorization: "Bearer sk-xxxx"
+  #   approval_mode: require_approval
+
+# 全局设置
+settings:
+  approval_timeout_minutes: 5
+  max_tools_per_server: 20
+  max_servers: 10
