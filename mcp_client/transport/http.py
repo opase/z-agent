@@ -89,6 +89,16 @@ class HttpTransport(TransportInterface):
         result = await self._send_request("tools/list", {})
         return result.get("tools", [])
 
+    async def list_resources(self) -> list[dict[str, Any]]:
+        """获取资源列表"""
+        result = await self._send_request("resources/list", {})
+        return result.get("resources", [])
+
+    async def read_resource(self, uri: str) -> list[dict[str, Any]]:
+        """读取指定 URI 的资源内容"""
+        result = await self._send_request("resources/read", {"uri": uri})
+        return result.get("contents", [])
+
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """调用 MCP 工具并返回文本结果"""
         result = await self._send_request("tools/call", {

@@ -1,8 +1,10 @@
 """MCP 客户端单元测试"""
+import asyncio
 import json
 import pytest
 from mcp_client.schema import normalize_tool_schema
 from mcp_client.registry import MCPToolRegistry
+from mcp_client.manager import MCPServerManager
 
 
 class TestSchemaNormalize:
@@ -143,3 +145,146 @@ class TestRegistryNamespace:
         """未知工具返回默认 require_approval"""
         registry = MCPToolRegistry()
         assert registry.get_approval_mode("mcp__none__noop") == "require_approval"
+
+
+class FakeTransport:
+    """模拟 MCP 传输层——可配置 capabilities/tools/resources"""
+
+    def __init__(self, capabilities=None, tools=None, resources=None, contents=None):
+        self._capabilities = capabilities or {}
+        self._tools = tools or []
+        self._resources = resources or []
+        self._contents = contents or []
+        self.call_tool_invocations = []
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    def is_connected(self):
+        return True
+
+    async def initialize(self):
+        return {"protocolVersion": "0.1", "capabilities": self._capabilities}
+
+    async def list_tools(self):
+        return self._tools
+
+    async def call_tool(self, tool_name, arguments):
+        self.call_tool_invocations.append((tool_name, arguments))
+        return f"real:{tool_name}"
+
+    async def list_resources(self):
+        return self._resources
+
+    async def read_resource(self, uri):
+        return self._contents
+
+
+def _make_manager(transport):
+    """构造使用假传输层的 MCPServerManager"""
+    registry = MCPToolRegistry()
+    manager = MCPServerManager("nonexistent.yaml", registry)
+    manager._create_transport = lambda cfg: transport
+    return manager, registry
+
+
+class TestResourceVirtualTools:
+    """resources capability → 虚拟工具注册与分流测试"""
+
+    ECHO_TOOL = {"name": "echo", "description": "回显", "inputSchema": {"type": "object", "properties": {}}}
+
+    def test_register_virtual_tools_when_capability_present(self):
+        """声明 resources capability 时注册两个虚拟工具"""
+        transport = FakeTransport(capabilities={"resources": {}}, tools=[self.ECHO_TOOL])
+        manager, registry = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        names = {m.full_name for m in registry.get_all_tools()}
+        assert "mcp__srv__list_resources" in names
+        assert "mcp__srv__read_resource" in names
+        # read_resource 的 uri 为必填
+        meta = registry.get_tool("mcp__srv__read_resource")
+        assert meta.input_schema["required"] == ["uri"]
+
+    def test_no_virtual_tools_without_capability(self):
+        """未声明 resources capability 时不注册虚拟工具"""
+        transport = FakeTransport(capabilities={"tools": {}}, tools=[self.ECHO_TOOL])
+        manager, registry = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        names = {m.full_name for m in registry.get_all_tools()}
+        assert names == {"mcp__srv__echo"}
+
+    def test_skip_virtual_tool_on_name_collision(self):
+        """服务器已有同名真实工具时跳过对应虚拟工具"""
+        real_read = {"name": "read_resource", "description": "真实工具", "inputSchema": {"type": "object", "properties": {}}}
+        transport = FakeTransport(capabilities={"resources": {}}, tools=[real_read])
+        manager, registry = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        # read_resource 保留真实注册（描述来自服务器），list_resources 仍为虚拟工具
+        assert registry.get_tool("mcp__srv__read_resource").description == "真实工具"
+        assert registry.get_tool("mcp__srv__list_resources") is not None
+        # 调用 read_resource 应透传给真实工具而非虚拟分流
+        result = asyncio.run(manager.call_tool("srv", "read_resource", {"uri": "x"}))
+        assert result == "real:read_resource"
+        assert transport.call_tool_invocations == [("read_resource", {"uri": "x"})]
+
+    def test_call_list_resources_formats_text(self):
+        """list_resources 分流到 resources/list 并格式化输出"""
+        transport = FakeTransport(
+            capabilities={"resources": {}},
+            resources=[
+                {"uri": "file:///a.md", "name": "说明文档", "description": "项目说明", "mimeType": "text/markdown"},
+                {"uri": "file:///b.bin"},
+            ],
+        )
+        manager, _ = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        result = asyncio.run(manager.call_tool("srv", "list_resources", {}))
+        assert "file:///a.md" in result
+        assert "说明文档" in result
+        assert "text/markdown" in result
+        assert "file:///b.bin" in result
+        # 未走 tools/call
+        assert transport.call_tool_invocations == []
+
+    def test_call_read_resource_returns_text(self):
+        """read_resource 分流到 resources/read 并返回文本内容"""
+        transport = FakeTransport(
+            capabilities={"resources": {}},
+            contents=[{"uri": "file:///a.md", "text": "hello resource"}],
+        )
+        manager, _ = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        result = asyncio.run(manager.call_tool("srv", "read_resource", {"uri": "file:///a.md"}))
+        assert result == "hello resource"
+
+    def test_read_resource_missing_uri(self):
+        """read_resource 缺少 uri 返回错误提示"""
+        transport = FakeTransport(capabilities={"resources": {}})
+        manager, _ = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        result = asyncio.run(manager.call_tool("srv", "read_resource", {}))
+        assert result.startswith("[错误]")
+        assert "uri" in result
+
+    def test_blob_content_placeholder(self):
+        """二进制资源内容以占位符文本表示"""
+        transport = FakeTransport(
+            capabilities={"resources": {}},
+            contents=[{"uri": "file:///img.png", "blob": "aGVsbG8=", "mimeType": "image/png"}],
+        )
+        manager, _ = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        result = asyncio.run(manager.call_tool("srv", "read_resource", {"uri": "file:///img.png"}))
+        assert "二进制资源" in result
+        assert "image/png" in result
+
+    def test_empty_resources_and_contents(self):
+        """空资源列表/空内容返回友好提示"""
+        transport = FakeTransport(capabilities={"resources": {}})
+        manager, _ = _make_manager(transport)
+        assert asyncio.run(manager._connect_server({"name": "srv"}))
+        assert "暂无 resources" in asyncio.run(manager.call_tool("srv", "list_resources", {}))
+        assert "内容为空" in asyncio.run(manager.call_tool("srv", "read_resource", {"uri": "file:///x"}))

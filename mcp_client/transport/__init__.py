@@ -36,3 +36,13 @@ class TransportInterface(ABC):
     async def list_tools(self) -> list[dict[str, Any]]:
         """获取服务器提供的工具列表，每个工具含 name/description/inputSchema"""
         ...
+
+    @abstractmethod
+    async def list_resources(self) -> list[dict[str, Any]]:
+        """获取服务器暴露的资源列表，每个资源含 uri/name/description/mimeType"""
+        ...
+
+    @abstractmethod
+    async def read_resource(self, uri: str) -> list[dict[str, Any]]:
+        """读取指定 URI 的资源内容，返回 contents 列表（text 或 blob 项）"""
+        ...

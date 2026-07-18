@@ -14,6 +14,63 @@ from mcp_client.transport.http import HttpTransport
 
 logger = logging.getLogger(__name__)
 
+# resource 虚拟工具定义：服务器声明 resources capability 时注册
+# 让 LLM 通过普通工具调用发现/读取 MCP resources，复用现有审批与执行链路
+_RESOURCE_VIRTUAL_TOOLS = (
+    (
+        "list_resources",
+        "列出该 MCP 服务器暴露的 resources，返回 URI、名称、MIME 类型和描述",
+        {"type": "object", "properties": {}},
+    ),
+    (
+        "read_resource",
+        "读取 MCP resource 内容。参数 uri 必须来自 list_resources 结果或用户明确提供的 resource URI",
+        {
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "要读取的 MCP resource URI"}},
+            "required": ["uri"],
+        },
+    ),
+)
+
+
+def _format_resources(resources: list[dict]) -> str:
+    """将 resources/list 结果格式化为 LLM 可读文本"""
+    if not resources:
+        return "该 MCP 服务器暂无 resources"
+    lines = []
+    for res in resources:
+        if not isinstance(res, dict):
+            continue
+        line = f"- {res.get('uri', '')}"
+        display = res.get("title") or res.get("name") or ""
+        if display:
+            line += f" — {display}"
+        if res.get("description"):
+            line += f"：{res['description']}"
+        if res.get("mimeType"):
+            line += f" [{res['mimeType']}]"
+        lines.append(line)
+    return "\n".join(lines) if lines else "该 MCP 服务器暂无 resources"
+
+
+def _format_resource_contents(contents: list[dict]) -> str:
+    """将 resources/read 结果格式化为文本，二进制内容以占位符表示"""
+    if not contents:
+        return "MCP resource 内容为空"
+    parts = []
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+        if item.get("text") is not None:
+            parts.append(str(item["text"]))
+        elif item.get("blob") is not None:
+            parts.append(
+                f"[二进制资源 {item.get('mimeType', '未知类型')}，"
+                f"base64 长度 {len(str(item['blob']))}，不支持直接展示]"
+            )
+    return "\n".join(parts) if parts else "MCP resource 内容为空"
+
 
 class MCPServerManager:
     """管理多个 MCP 服务器的连接、握手、工具发现和状态"""
@@ -99,7 +156,9 @@ class MCPServerManager:
 
         # 握手 + 工具发现
         try:
-            await transport.initialize()
+            init_result = await transport.initialize()
+            capabilities = (init_result or {}).get("capabilities") or {}
+            supports_resources = capabilities.get("resources") is not None
             tools = await transport.list_tools()
 
             approval_mode = server_cfg.get("approval_mode", "require_approval")
@@ -121,11 +180,36 @@ class MCPServerManager:
                 )
                 registered += 1
 
+            # resources capability → 注册虚拟工具（与真实工具同名时跳过，避免覆盖）
+            virtual_tools: set[str] = set()
+            if supports_resources:
+                real_names = {t.get("name") for t in tools}
+                for vt_name, vt_desc, vt_schema in _RESOURCE_VIRTUAL_TOOLS:
+                    if vt_name in real_names:
+                        logger.warning(
+                            "服务器 [%s] 已有同名真实工具 %s，跳过虚拟资源工具注册", name, vt_name,
+                        )
+                        continue
+                    self.registry.register(
+                        server_name=name,
+                        tool_name=vt_name,
+                        description=vt_desc,
+                        input_schema=vt_schema,
+                        server_approval_mode=approval_mode,
+                        tool_approval_overrides=tool_overrides,
+                    )
+                    virtual_tools.add(vt_name)
+                    registered += 1
+
             self._servers[name] = {
                 "config": server_cfg,
                 "transport": transport,
+                "virtual_resource_tools": virtual_tools,
             }
-            logger.info("MCP 服务器 [%s] 连接成功: %d 个工具已注册", name, registered)
+            logger.info(
+                "MCP 服务器 [%s] 连接成功: %d 个工具已注册（含 %d 个资源虚拟工具）",
+                name, registered, len(virtual_tools),
+            )
             return True
 
         except Exception as e:
@@ -198,7 +282,10 @@ class MCPServerManager:
             import time
             from core import metrics
             t0 = time.time()
-            result = await transport.call_tool(tool_name, arguments)
+            if tool_name in info.get("virtual_resource_tools", ()):
+                result = await self._call_resource_tool(transport, tool_name, arguments)
+            else:
+                result = await transport.call_tool(tool_name, arguments)
             metrics.mcp_tool_calls.labels(server=server_name, tool=tool_name).inc()
             metrics.mcp_tool_duration.labels(server=server_name, tool=tool_name).observe(time.time() - t0)
             return result
@@ -206,6 +293,16 @@ class MCPServerManager:
             from core import metrics
             metrics.mcp_tool_calls.labels(server=server_name, tool=tool_name).inc()
             return f"[错误] MCP 工具调用失败: {e}"
+
+    async def _call_resource_tool(self, transport, tool_name: str, arguments: dict) -> str:
+        """执行 resource 虚拟工具（list_resources / read_resource）"""
+        if tool_name == "list_resources":
+            return _format_resources(await transport.list_resources())
+        # read_resource
+        uri = (arguments or {}).get("uri", "")
+        if not uri:
+            return "[错误] read_resource 缺少必填参数 uri"
+        return _format_resource_contents(await transport.read_resource(uri))
 
     async def shutdown_all(self) -> None:
         """关闭所有 MCP 服务器连接"""
