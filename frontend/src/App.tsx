@@ -42,6 +42,7 @@ export default function App() {
   // 审批队列（HITL — Phase 1 新增）
   const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([]);
   const [currentApproval, setCurrentApproval] = useState<ApprovalRequest | null>(null);
+  const [approvalSubmitting, setApprovalSubmitting] = useState(false);
 
   // 执行模式（Phase 2 前端选择器）
   const [execMode, setExecMode] = useState<string>('auto');
@@ -206,6 +207,7 @@ export default function App() {
         thread_id: event.thread_id,
         status: 'pending',
         hierarchy: 'tool',
+        assistantId,
       };
       setApprovalQueue((prev) => {
         if (prev.length === 0 && !currentApproval) {
@@ -223,6 +225,7 @@ export default function App() {
         thread_id: sessionId || 'default',
         status: 'pending',
         hierarchy: 'review',
+        assistantId,
         step_id: event.step_id,
         description: event.description,
         last_result: event.last_result,
@@ -245,6 +248,7 @@ export default function App() {
         thread_id: sessionId || 'default',
         status: 'pending',
         hierarchy: 'plan',
+        assistantId,
         description: event.plan?.summary || event.plan?.goal || '',
       };
       setApprovalQueue((prev) => {
@@ -270,7 +274,7 @@ export default function App() {
     const userMsg = appendUserMessage(question);
     const assistantId = `a-${Date.now()}`;
     const assistantPlaceholder: UIMessage = {
-      id: assistantId, role: 'assistant', content: '', timestamp: now(),
+      id: assistantId, role: 'assistant', content: '', timestamp: now(), mode: execMode,
     };
     setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
 
@@ -296,7 +300,7 @@ export default function App() {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
-            ? { ...m, content: result.text, mode: meta.mode, turnCount: meta.turn_count, verification: meta.verification, planProgress: pp, sources: meta.sources || [] }
+            ? { ...m, content: result.text, mode: meta.mode ?? m.mode, turnCount: meta.turn_count ?? m.turnCount, verification: meta.verification ?? m.verification, planProgress: pp, sources: meta.sources || [], thinkingSteps: m.thinkingSteps }
             : m,
         ),
       );
@@ -328,7 +332,7 @@ export default function App() {
     const userMsg = appendUserMessage(question, files.length);
     const assistantId = `a-${Date.now()}`;
     const assistantPlaceholder: UIMessage = {
-      id: assistantId, role: 'assistant', content: '', timestamp: now(),
+      id: assistantId, role: 'assistant', content: '', timestamp: now(), mode: execMode,
     };
     setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
 
@@ -357,7 +361,7 @@ export default function App() {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
-            ? { ...m, content: result.text, mode: meta.mode, turnCount: meta.turn_count, verification: meta.verification, sources: meta.sources || [] }
+            ? { ...m, content: result.text, mode: meta.mode ?? m.mode, turnCount: meta.turn_count ?? m.turnCount, verification: meta.verification ?? m.verification, sources: meta.sources || [], thinkingSteps: m.thinkingSteps }
             : m,
         ),
       );
@@ -445,21 +449,134 @@ export default function App() {
   };
 
   const resolveApproval = async (decision: 'approved' | 'rejected' | 'approve_all', reason?: string) => {
-    if (!currentApproval) return;
-    try {
-      await resumeApproval(currentApproval.thread_id, {
-        user_id: userId,
-        decision,
-        reject_reason: reason,
-      });
-    } catch (e: any) {
-      console.error('审批失败:', e);
-    }
+    if (!currentApproval || approvalSubmitting) return;
+    const resolvedApproval = currentApproval;
+    setApprovalSubmitting(true);
+
     setApprovalQueue((prev) => {
       const next = prev.slice(1);
       setCurrentApproval(next.length > 0 ? next[0] : null);
       return next;
     });
+
+    if (resolvedApproval.assistantId) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === resolvedApproval.assistantId
+            ? {
+                ...m,
+                handoffStatus: {
+                  decision,
+                  tool: resolvedApproval.tool,
+                  state: 'running',
+                },
+              }
+            : m,
+        ),
+      );
+    }
+
+    try {
+      const result = await resumeApproval(resolvedApproval.thread_id, {
+        user_id: userId,
+        decision,
+        reject_reason: reason,
+      });
+
+      let nextInterruptReq: ApprovalRequest | null = null;
+      const interrupt = result.interrupt;
+      if (interrupt?.type === 'approval_required') {
+        nextInterruptReq = {
+          approval_id: interrupt.approval_id,
+          tool: interrupt.tool,
+          args: interrupt.args,
+          server: interrupt.server,
+          thread_id: interrupt.thread_id,
+          status: 'pending',
+          hierarchy: 'tool',
+          assistantId: resolvedApproval.assistantId,
+        };
+      } else if (interrupt?.type === 'review_escalation') {
+        nextInterruptReq = {
+          approval_id: `review-${interrupt.step_id}`,
+          tool: interrupt.step_id,
+          args: {},
+          server: 'Multi-Agent Reviewer',
+          thread_id: resolvedApproval.thread_id,
+          status: 'pending',
+          hierarchy: 'review',
+          assistantId: resolvedApproval.assistantId,
+          step_id: interrupt.step_id,
+          description: interrupt.description,
+          last_result: interrupt.last_result,
+          review_issues: interrupt.review_issues,
+          retries_exhausted: interrupt.retries_exhausted,
+        };
+      } else if (interrupt?.type === 'plan_review') {
+        nextInterruptReq = {
+          approval_id: `plan-${interrupt.plan?.id || 'unknown'}`,
+          tool: '执行计划审批',
+          args: interrupt.plan || {},
+          server: 'Planner',
+          thread_id: resolvedApproval.thread_id,
+          status: 'pending',
+          hierarchy: 'plan',
+          assistantId: resolvedApproval.assistantId,
+          description: interrupt.plan?.summary || interrupt.plan?.goal || '',
+        };
+      }
+
+      if (resolvedApproval.assistantId && result.answer) {
+        const pp = planProgressMap[resolvedApproval.assistantId];
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === resolvedApproval.assistantId
+              ? { ...m, content: result.answer, planProgress: pp, handoffStatus: undefined, turnCount: result.turn_count ?? m.turnCount, thinkingSteps: m.thinkingSteps }
+              : m,
+          ),
+        );
+        setLastResult({
+          answer: result.answer,
+          session_id: resolvedApproval.thread_id,
+          status: result.status,
+        });
+      }
+
+      if (nextInterruptReq) {
+        setApprovalQueue((prev) => {
+          const next = [...prev, nextInterruptReq];
+          setCurrentApproval((cur) => cur || next[0]);
+          return next;
+        });
+      }
+      setError('');
+    } catch (e: any) {
+      console.error('审批失败:', e);
+      setError(e.message || '审批失败，请稍后重试');
+      setApprovalQueue((prev) => {
+        const restored = [resolvedApproval, ...prev];
+        setCurrentApproval(resolvedApproval);
+        return restored;
+      });
+      if (resolvedApproval.assistantId) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === resolvedApproval.assistantId
+              ? {
+                  ...m,
+                  handoffStatus: {
+                    decision,
+                    tool: resolvedApproval.tool,
+                    state: 'failed',
+                  },
+                }
+              : m,
+          ),
+        );
+      }
+    } finally {
+      setApprovalSubmitting(false);
+    }
   };
 
   const handleApprove = () => resolveApproval('approved');
@@ -537,6 +654,7 @@ export default function App() {
       <ApprovalModal
         request={currentApproval}
         isOpen={currentApproval !== null}
+        submitting={approvalSubmitting}
         onApprove={handleApprove}
         onApproveAll={handleApproveAll}
         onReject={handleReject}

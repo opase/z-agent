@@ -120,6 +120,7 @@ export interface ApprovalRequest {
   server: string;
   thread_id: string;
   status: 'pending' | 'approved' | 'rejected' | 'expired';
+  assistantId?: string;
   // review_escalation 扩展字段
   hierarchy?: ApprovalHierarchy;
   step_id?: string;
@@ -133,6 +134,14 @@ export interface ApprovalResult {
   user_id: string;
   decision: 'approved' | 'rejected' | 'approve_all';
   reject_reason?: string;
+}
+
+export interface ResumeResponse {
+  status: 'approved' | 'rejected' | 'interrupted';
+  message: string;
+  answer: string;
+  turn_count?: number;
+  interrupt?: SSEEvent;
 }
 
 // ==================== Plan/Multi-Agent 进度类型（Phase 2 前端渲染） ====================
@@ -175,6 +184,12 @@ export interface SourceCitation {
   section?: string;
 }
 
+export interface HandoffStatus {
+  decision: 'approved' | 'rejected' | 'approve_all';
+  tool?: string;
+  state: 'running' | 'failed';
+}
+
 export interface UIMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -188,5 +203,6 @@ export interface UIMessage {
   detectedProducts?: string[];
   planProgress?: PlanProgress;  // Plan/Multi-Agent 执行进度
   thinkingSteps?: ThinkingStep[];  // ReAct 思考过程
+  handoffStatus?: HandoffStatus;  // 审批后继续执行状态
   sources?: SourceCitation[];  // 来源引用
 }

@@ -230,6 +230,8 @@ flowchart LR
 
 - 单 Agent 循环：LLM 自主决定调用工具或输出回答，每次工具结果回灌上下文后继续推理。
 - 工具执行前触发 HITL 审批检查，MCP 工具可配置需人工批准。
+- 审批通过 LangGraph 原生 `interrupt()` 暂停图执行，`Command(resume=...)` 从 checkpoint 恢复，状态不丢失。
+- 前端通过 SSE `text/event-stream` 结构化事件（`thinking`/`tool_call`/`tool_result`/`approval_required` 等）实时展示思考过程与审批状态。
 - 上限 5 轮，超过后强制基于已有信息生成回答。
 
 ### Plan-and-Execute
@@ -287,11 +289,12 @@ flowchart LR
 | 层级 | 触发点 | 机制 |
 |------|--------|------|
 | **Plan Review** | 计划执行前 | `interrupt("plan_review")` |
-| **Tool Approval** | MCP 工具调用前 | `asyncio.Event` 原地等待（不重启节点） |
+| **Tool Approval** | MCP 工具调用前 | LangGraph `interrupt()` + `Command(resume=...)` |
 | **Review Escalation** | Multi-Agent 审查耗尽 | `interrupt("review_escalation")` |
 
 - 审批记录持久化到 SQLite（`approval_requests` 表，与会话库共享），支持自动过期与崩溃标记。
-- 图编译挂载 `MemorySaver` checkpoint，重启后可恢复中断点。
+- 图编译挂载 `MemorySaver` checkpoint，`interrupt()` 挂起后通过 `Command(resume=...)` 从断点恢复，状态不丢失。
+- **MCP Resources:** 服务器声明 `resources` capability 时自动注册 `mcp__{server}__list_resources` / `read_resource` 虚拟工具，复用现有审批/重连/指标链路。
 
 ---
 

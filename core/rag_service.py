@@ -222,19 +222,17 @@ class RagService:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             return
 
-        # ── Phase 2: 检查 plan_review / review_escalation 中断 ──
-        # 工具审批已改用 asyncio.Event 原地等待，不再走 LangGraph interrupt()
+        # ── Phase 2: 检查 LangGraph 中断（工具审批 / 计划审批 / 审查升级） ──
         state_snapshot = await self.agent_graph.aget_state(config)
 
-        if state_snapshot and state_snapshot.next and state_snapshot.interrupts:
+        if state_snapshot and state_snapshot.interrupts:
             interrupt_list = state_snapshot.interrupts
             item = interrupt_list[0] if interrupt_list else None
             if item is not None:
                 payload = getattr(item, "value", item)
                 if isinstance(payload, dict):
                     evt_type = payload.get("type", "")
-                    # 只处理 plan_review / review_escalation，工具审批已走 Event
-                    if evt_type in ("plan_review", "review_escalation"):
+                    if evt_type in ("approval_required", "plan_review", "review_escalation"):
                         sse_evt = {"type": evt_type, **payload}
                         yield f"data: {json.dumps(sse_evt, ensure_ascii=False)}\n\n"
                         logger.info("Stream 路径中断: %s", evt_type)
@@ -242,6 +240,7 @@ class RagService:
                             "status": "interrupted",
                             "interrupt_type": evt_type,
                             "session_id": thread_id,
+                            "mode": mode,
                             "turn_count": memory.turn_count if memory else 1,
                         }, ensure_ascii=False)
                         yield f"\n__CA_META__{meta}__CA_META_END__"

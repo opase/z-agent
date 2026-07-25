@@ -5,6 +5,7 @@ import type { ApprovalRequest } from '../types';
 interface Props {
   request: ApprovalRequest | null;
   isOpen: boolean;
+  submitting?: boolean;
   onApprove: () => void;
   onApproveAll: () => void;
   onReject: (reason?: string) => void;
@@ -12,7 +13,7 @@ interface Props {
 }
 
 /** 审批弹窗——根据 hierarchy 渲染不同 UI：工具审批 / 审查升级 / 计划审批 */
-export default function ApprovalModal({ request, isOpen, onApprove, onApproveAll, onReject, onClose }: Props) {
+export default function ApprovalModal({ request, isOpen, submitting = false, onApprove, onApproveAll, onReject, onClose }: Props) {
   const [rejectReason, setRejectReason] = useState('');
   const [elapsed, setElapsed] = useState(0);
 
@@ -79,16 +80,18 @@ export default function ApprovalModal({ request, isOpen, onApprove, onApproveAll
           {/* 底部：接受 / 跳过 */}
           <div className="px-6 py-4 border-t border-border flex gap-2">
             <button
-              onClick={() => { onReject(rejectReason || undefined); setRejectReason(''); }}
-              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border rounded-lg transition-colors"
+              onClick={() => { if (!submitting) { onReject(rejectReason || undefined); setRejectReason(''); } }}
+              disabled={submitting}
+              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors"
             >
               <X size={15} /> 跳过此步骤
             </button>
             <button
-              onClick={() => { onApprove(); }}
-              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 rounded-lg transition-colors shadow-sm"
+              onClick={() => { if (!submitting) onApprove(); }}
+              disabled={submitting}
+              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors shadow-sm"
             >
-              <Check size={15} /> 接受当前结果
+              <Check size={15} /> {submitting ? '处理中...' : '接受当前结果'}
             </button>
           </div>
         </div>
@@ -120,16 +123,18 @@ export default function ApprovalModal({ request, isOpen, onApprove, onApproveAll
           </div>
           <div className="px-6 py-4 border-t border-border flex gap-2">
             <button
-              onClick={() => { onReject(rejectReason || undefined); setRejectReason(''); }}
-              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border rounded-lg transition-colors"
+              onClick={() => { if (!submitting) { onReject(rejectReason || undefined); setRejectReason(''); } }}
+              disabled={submitting}
+              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors"
             >
               <X size={15} /> 取消计划
             </button>
             <button
-              onClick={() => { onApprove(); }}
-              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 rounded-lg transition-colors shadow-sm"
+              onClick={() => { if (!submitting) onApprove(); }}
+              disabled={submitting}
+              className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors shadow-sm"
             >
-              <Check size={15} /> 批准计划
+              <Check size={15} /> {submitting ? '处理中...' : '批准计划'}
             </button>
           </div>
         </div>
@@ -195,21 +200,22 @@ export default function ApprovalModal({ request, isOpen, onApprove, onApproveAll
         <div className="px-6 py-4 border-t border-border flex gap-2">
           <button
             onClick={() => { onReject(rejectReason || undefined); setRejectReason(''); }}
-            className="inline-flex items-center gap-1 px-3 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border rounded-lg transition-colors"
+            className="inline-flex items-center gap-1 px-3 py-2 text-sm font-medium text-fg-muted bg-surface-2 hover:bg-border disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors"
           >
             <X size={15} /> 拒绝
           </button>
           <button
             onClick={() => { onApprove(); }}
-            className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 rounded-lg transition-colors shadow-sm"
+            className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-green-700 hover:bg-green-800 disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors shadow-sm"
           >
-            <Check size={15} /> 批准
+            <Check size={15} /> {submitting ? '处理中...' : '批准'}
           </button>
           <button
-            onClick={() => { onApproveAll(); }}
-            className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors shadow-sm"
+            onClick={() => { if (!submitting) onApproveAll(); }}
+            disabled={submitting}
+            className="flex-1 inline-flex items-center justify-center gap-1 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed disabled:opacity-60 disabled:cursor-not-allowed rounded-lg transition-colors shadow-sm"
           >
-            <Check size={15} /> 批准所有
+            <Check size={15} /> {submitting ? '处理中...' : '批准所有'}
           </button>
         </div>
       </div>

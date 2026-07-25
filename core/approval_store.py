@@ -133,7 +133,7 @@ class ApprovalStore:
                 """UPDATE approval_requests
                    SET status = 'expired', resolved_at = datetime('now'),
                        reject_reason = '审批超时'
-                   WHERE status = 'pending' AND expires_at < datetime('now')""",
+                   WHERE status = 'pending' AND expires_at < datetime('now', 'localtime')""",
             )
             conn.commit()
             return cursor.rowcount

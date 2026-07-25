@@ -7,6 +7,7 @@ import type {
   HealthStatus,
   KnowledgeUploadResponse,
   ApprovalResult,
+  ResumeResponse,
   SSEEvent,
 } from '../types';
 
@@ -25,8 +26,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 // ==================== 审批 API ====================
 
 /** 发送审批决定 — 批准或拒绝 MCP 工具调用 */
-export async function resumeApproval(threadId: string, result: ApprovalResult): Promise<any> {
-  return request(`/approval/${encodeURIComponent(threadId)}/resume`, {
+export async function resumeApproval(threadId: string, result: ApprovalResult): Promise<ResumeResponse> {
+  return request<ResumeResponse>(`/approval/${encodeURIComponent(threadId)}/resume`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(result),

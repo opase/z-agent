@@ -178,10 +178,14 @@ def build_multi_agent_graph(rag_service, checkpointer=None) -> CompiledStateGrap
             # LangGraph Send 只把 payload 传给目标节点，不会带上主图 state，
             # 因此必须把 execute_step_node 需要的 steps / goal 一并放进 payload。
             goal = state.get("goal", "")
+            tid = state.get("thread_id", "default")
+            uid = state.get("user_id", "default")
             return [Send("execute_step", {
                         "current_step_id": sid,
                         "steps": steps,
                         "goal": goal,
+                        "thread_id": tid,
+                        "user_id": uid,
                     })
                     for sid in executable]
 

@@ -1,9 +1,7 @@
 """审批 API 路由 — HITL 审批恢复 + SSE 结构化事件
 
-工具审批: asyncio.Event 原地等待，resolve() 内 signal event 即恢复。
-计划审批/审查升级: LangGraph interrupt() + Command(resume=...) 兜底。
+工具审批 / 计划审批 / 审查升级统一通过 LangGraph interrupt() + Command(resume=...) 恢复。
 """
-import json
 import logging
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -32,10 +30,10 @@ def _get_rag(request: Request):
 
 @router.post("/{thread_id}/resume")
 async def resume_approval(thread_id: str, body: ApprovalResult, request: Request):
-    """审批恢复端点
+    """审批恢复端点。
 
-    工具审批: resolve() → signal_decision() → Event 唤醒工具继续执行。
-    计划/审查审批: Command(resume=...) 恢复 LangGraph interrupt。
+    当前线程必须处于 LangGraph interrupt 状态。接口先更新审批审计记录，
+    再通过 Command(resume=...) 从 checkpoint 恢复图执行。
     """
     rag = _get_rag(request)
 
@@ -44,80 +42,94 @@ async def resume_approval(thread_id: str, body: ApprovalResult, request: Request
         raise HTTPException(400, "decision 必须为 approved / approve_all / rejected")
 
     decision_val = "approved" if body.decision in ("approved", "approve_all") else "rejected"
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # 批准所有: 设置线程级自动批准标记
-    if body.decision == "approve_all":
-        rag.approval_mgr.set_approve_all(thread_id)
+    state_snapshot = await rag.agent_graph.aget_state(config)
+    if not state_snapshot or not state_snapshot.interrupts:
+        logger.warning(
+            "审批恢复失败: thread=%s 无可恢复中断 snapshot=%s next=%s interrupts=%s",
+            thread_id,
+            bool(state_snapshot),
+            getattr(state_snapshot, "next", None) if state_snapshot else None,
+            getattr(state_snapshot, "interrupts", None) if state_snapshot else None,
+        )
+        raise HTTPException(409, "当前线程没有待恢复的审批中断")
 
-    # 持久化审批记录 + signal event（工具审批通过 Event 机制自动继续）
-    pending = rag.approval_mgr.get_pending(thread_id)
-    if pending:
-        rag.approval_mgr.resolve(
-            approval_id=pending["id"],
+    item = state_snapshot.interrupts[0]
+    interrupt_payload = getattr(item, "value", item)
+    interrupt_type = ""
+    if isinstance(interrupt_payload, dict):
+        interrupt_type = interrupt_payload.get("type", "")
+
+    if interrupt_type == "approval_required":
+        approval_id = interrupt_payload.get("approval_id") if isinstance(interrupt_payload, dict) else None
+        if not approval_id:
+            raise HTTPException(500, "工具审批中断缺少 approval_id")
+        resolved = rag.approval_mgr.resolve(
+            approval_id=approval_id,
             user_id=body.user_id,
             decision=body.decision,
             reject_reason=body.reject_reason,
             operator_id=body.user_id,
         )
+        if not resolved.get("success"):
+            raise HTTPException(409, resolved.get("message", "审批状态更新失败"))
+        resume_data = {"decision": decision_val}
+        if body.reject_reason:
+            resume_data["reject_reason"] = body.reject_reason
+    elif interrupt_type == "review_escalation":
+        resume_data = {
+            "decision": decision_val,
+            "action": "accept_anyway" if decision_val == "approved" else "skip",
+        }
+        if body.reject_reason:
+            resume_data["reject_reason"] = body.reject_reason
+    elif interrupt_type == "plan_review":
+        resume_data = {
+            "decision": decision_val,
+            "action": "cancel" if decision_val == "rejected" else "approved",
+        }
+        if body.reject_reason:
+            resume_data["feedback"] = body.reject_reason
+    else:
+        raise HTTPException(409, f"不支持的审批中断类型: {interrupt_type or 'unknown'}")
 
-    # 兜底: LangGraph Command(resume=...) 仅用于 plan_review / review_escalation
-    # 工具审批走 Event 方案时 graph 不处于 interrupt 状态，跳过此步。
-    answer = ""
-    config = {"configurable": {"thread_id": thread_id}}
+    final_result = await rag.agent_graph.ainvoke(
+        Command(resume=resume_data), config,
+    )
 
-    try:
-        state_snapshot = await rag.agent_graph.aget_state(config)
-        if state_snapshot and state_snapshot.next and state_snapshot.interrupts:
-            # 获取中断负载，判断类型以构造正确的 resume 数据
-            item = state_snapshot.interrupts[0]
-            interrupt_payload = getattr(item, "value", item)
-            interrupt_type = ""
-            if isinstance(interrupt_payload, dict):
-                interrupt_type = interrupt_payload.get("type", "")
+    if isinstance(final_result, dict) and "__interrupt__" in final_result:
+        interrupt_info = final_result["__interrupt__"]
+        item = interrupt_info[0] if isinstance(interrupt_info, list) and interrupt_info else interrupt_info
+        next_payload = getattr(item, "value", item)
+        if isinstance(next_payload, dict):
+            return {
+                "status": "interrupted",
+                "message": "审批已处理，等待下一次审批",
+                "answer": "",
+                "interrupt": next_payload,
+            }
 
-            # 根据中断类型构造 resume 数据
-            if interrupt_type == "review_escalation":
-                # Multi-Agent 审查升级：approved → accept_anyway, rejected → skip
-                resume_data = {
-                    "decision": decision_val,
-                    "action": "accept_anyway" if decision_val == "approved" else "skip",
-                }
-                if body.reject_reason:
-                    resume_data["reject_reason"] = body.reject_reason
-            elif interrupt_type == "plan_review":
-                # 计划审批：approved → 继续, rejected → cancel
-                resume_data = {
-                    "decision": decision_val,
-                    "action": "cancel" if decision_val == "rejected" else "approved",
-                }
-                if body.reject_reason:
-                    resume_data["feedback"] = body.reject_reason
-            else:
-                # 兜底：工具审批等（理论上走不到这里，Event 机制已处理）
-                resume_data = {"decision": decision_val}
-                if body.reject_reason:
-                    resume_data["reject_reason"] = body.reject_reason
+    output = final_result.get("final_output", final_result)
+    answer = output.get("answer", "") if isinstance(output, dict) else str(output)
 
-            final_result = await rag.agent_graph.ainvoke(
-                Command(resume=resume_data), config,
-            )
-            output = final_result.get("final_output", final_result)
-            if isinstance(output, dict):
-                answer = output.get("answer", "")
-            else:
-                answer = str(output)
-    except Exception:
-        pass  # aget_state 可能因并发等抛异常，忽略
+    sessions = getattr(request.app.state, "sessions", None)
+    turn_count = 1
+    if sessions and answer:
+        session = sessions.get(thread_id, body.user_id)
+        if session:
+            question = final_result.get("question", "") if isinstance(final_result, dict) else ""
+            if question:
+                session.memory.add_message("user", question)
+            session.memory.add_message("assistant", answer)
+            turn_count = session.memory.turn_count
 
-    logger.info("审批恢复成功: thread=%s decision=%s answer_chars=%d",
-                thread_id, decision_val, len(answer))
+    logger.info("审批恢复成功: thread=%s type=%s decision=%s answer_chars=%d",
+                thread_id, interrupt_type, decision_val, len(answer))
 
     return {
         "status": decision_val,
-        "message": (
-            "审批已通过"
-            if decision_val == "approved"
-            else "审批已拒绝"
-        ),
+        "message": "审批已通过" if decision_val == "approved" else "审批已拒绝",
         "answer": answer,
+        "turn_count": turn_count,
     }

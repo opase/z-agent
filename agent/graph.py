@@ -182,10 +182,10 @@ def _build_input_text(state: AgentState) -> str:
 async def _execute_tool(tool_call: dict, rag_service,
                         thread_id: str = "default", user_id: str = "default",
                         skip_hitl: bool = False) -> str:
-    """执行单个工具调用，MCP 工具带 HITL 审批检查
+    """执行单个工具调用，MCP 工具带 HITL 审批检查。
 
-    asyncio.Event 原地等待审批决议，不重启节点函数。
-    消息历史自然保留，无需缓存/恢复逻辑。
+    工具审批统一使用 LangGraph interrupt() 暂停图执行，恢复由
+    Command(resume=...) 负责，避免自定义等待层导致状态无法 checkpoint。
     """
     name = tool_call["name"]
     args = tool_call.get("args", {})
@@ -199,42 +199,22 @@ async def _execute_tool(tool_call: dict, rag_service,
         if mode != "auto_approve":
             parts = name.split("__", 2)
             server_name = parts[1] if len(parts) == 3 else "unknown"
-            approval_id = str(uuid.uuid4())
+            tool_call_id = tool_call.get("id") or f"{name}:{args}"
+            approval_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"z-agent:approval:{thread_id}:{tool_call_id}",
+            ))
             rag_service.approval_mgr.create_request(
                 user_id, thread_id, name, args, server_name, approval_id,
             )
 
-            # 检测 stream 上下文：adispatch_custom_event 成功 → stream 路径
-            # 注意：非 stream 上下文中 ensure_config() 或 adispatch_custom_event 会抛异常，
-            # 此时走 interrupt() 兜底。其他异常也应走 interrupt() 而非静默忽略。
-            is_stream = False
-            try:
-                from langchain_core.runnables import ensure_config
-                _cfg = ensure_config()
-                from langchain_core.callbacks.manager import adispatch_custom_event
-                await adispatch_custom_event("approval_required", {
-                    "type": "approval_required",
-                    "approval_id": approval_id,
-                    "tool": name, "args": args,
-                    "server": server_name, "thread_id": thread_id,
-                }, config=_cfg)
-                is_stream = True
-            except (RuntimeError, ValueError, LookupError):
-                logger.debug("非 stream 上下文，审批走 interrupt 路径")
-            except Exception as e:
-                logger.warning("事件派发异常，降级为 interrupt 路径: %s", e)
-
-            if is_stream:
-                # asyncio.Event 原地等待（stream 路径，不重启节点）
-                decision = await rag_service.approval_mgr.await_decision(approval_id)
-            else:
-                # 非 stream 路径兜底: LangGraph interrupt()（ainvoke 可检测中断）
-                decision = interrupt({
-                    "type": "approval_required",
-                    "approval_id": approval_id,
-                    "tool": name, "args": args,
-                    "server": server_name, "thread_id": thread_id,
-                })
+            decision = interrupt({
+                "type": "approval_required",
+                "hierarchy": "tool",
+                "approval_id": approval_id,
+                "tool": name, "args": args,
+                "server": server_name, "thread_id": thread_id,
+            })
 
             if isinstance(decision, dict) and decision.get("decision") == "approved":
                 pass  # 继续往下执行工具

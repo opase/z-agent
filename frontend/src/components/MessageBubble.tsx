@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Bot, User, Image, Tag, CheckCircle, AlertTriangle, ListChecks, Circle, CircleCheck, CircleX, Brain, Wrench, ChevronDown, FileText } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -33,6 +33,19 @@ interface Props {
 export default function MessageBubble({ message, streaming }: Props) {
   const isUser = message.role === 'user';
   const [thinkingOpen, setThinkingOpen] = useState(false);
+
+  // 调试：监测 thinkingSteps 数据流，定位“思考步骤丢失”根因
+  const prevStepsLen = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const len = message.thinkingSteps?.length ?? 0;
+    if (prevStepsLen.current !== len) {
+      console.debug(
+        `[MessageBubble:${message.id}] thinkingSteps changed: ${prevStepsLen.current} → ${len}`,
+        message.thinkingSteps ? message.thinkingSteps.map(s => s.kind) : null,
+      );
+      prevStepsLen.current = len;
+    }
+  }, [message.thinkingSteps, message.id]);
 
   return (
     <div className={`flex gap-3 animate-fade-in-up ${isUser ? 'justify-end' : ''}`}>
@@ -104,11 +117,72 @@ export default function MessageBubble({ message, streaming }: Props) {
               </div>
             )}
 
-            <div className={`bg-surface/80 border border-border px-4 py-3 rounded-2xl rounded-tl-md shadow-card md-body ${streaming ? 'typing-caret' : ''}`}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {message.content}
-              </ReactMarkdown>
-            </div>
+            {message.handoffStatus && (
+              <div className={`relative overflow-hidden rounded-2xl border px-4 py-3 shadow-card ${
+                message.handoffStatus.state === 'failed'
+                  ? 'border-danger/25 bg-danger/5'
+                  : 'border-accent/25 bg-[linear-gradient(135deg,rgba(var(--accent),0.10),rgba(var(--surface),0.86)_52%,rgba(var(--primary),0.08))]'
+              }`}>
+                <div className="pointer-events-none absolute left-0 top-0 h-full w-1 bg-brand-gradient" aria-hidden="true" />
+                <div className="flex items-start gap-3 pl-1">
+                  <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
+                    message.handoffStatus.state === 'failed'
+                      ? 'border-danger/25 bg-danger/10 text-danger'
+                      : 'border-accent/30 bg-accent/10 text-accent'
+                  }`}>
+                    {message.handoffStatus.state === 'failed' ? (
+                      <AlertTriangle size={15} />
+                    ) : (
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-60" />
+                        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-accent" />
+                      </span>
+                    )}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-fg">
+                        {message.handoffStatus.state === 'failed'
+                          ? '恢复执行失败'
+                          : message.handoffStatus.decision === 'rejected'
+                            ? '已拒绝，Agent 正在改道'
+                            : '已接管，继续执行'}
+                      </span>
+                      <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                        message.handoffStatus.decision === 'rejected'
+                          ? 'border-danger/25 bg-danger/10 text-danger'
+                          : 'border-success/25 bg-success/10 text-success'
+                      }`}>
+                        {message.handoffStatus.decision === 'approve_all'
+                          ? '批准所有'
+                          : message.handoffStatus.decision === 'approved'
+                            ? '已批准'
+                            : '已拒绝'}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-fg-muted">
+                      {message.handoffStatus.state === 'failed'
+                        ? '没有完成恢复，请在审批弹窗中重试。'
+                        : '人工决策已写入，正在从断点续跑图状态。'}
+                    </p>
+                    {message.handoffStatus.tool && (
+                      <div className="mt-2 flex items-center gap-1.5 truncate rounded-lg border border-border/70 bg-surface/60 px-2 py-1 text-[10px] text-fg-subtle">
+                        <Wrench size={10} className="shrink-0 text-info" />
+                        <span className="truncate font-mono">{message.handoffStatus.tool}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {message.content.trim() && (
+              <div className={`bg-surface/80 border border-border px-4 py-3 rounded-2xl rounded-tl-md shadow-card md-body ${streaming ? 'typing-caret' : ''}`}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {message.content}
+                </ReactMarkdown>
+              </div>
+            )}
 
             {/* Plan/Multi-Agent 执行进度——任务时间线（Phase 2） */}
             {message.planProgress && message.planProgress.tasks.length > 0 && (() => {
