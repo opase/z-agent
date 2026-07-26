@@ -434,4 +434,6 @@ flowchart LR
 - [ ] **知识库权限管理：RBAC + ABAC** — 当前知识库是全局单库、所有用户共享，无访问隔离。计划引入基于角色的访问控制（RBAC）与基于属性的访问控制（ABAC）：RBAC 管「谁能查询 / 上传 / 管理哪些知识库」，ABAC 按文档属性（部门、密级、标签等）做动态过滤与行级授权，支持多租户隔离。
 - [ ] **向量库迁移 Qdrant** — 当前使用 ChromaDB（本地持久化）。计划支持 Qdrant，获得水平扩展、payload 过滤检索与生产级运维能力；检索层已做抽象，可平滑切换后端。
 - [ ] **Redis 持久化 Checkpoint 与记忆** — 当前 LangGraph 使用 `MemorySaver`（内存 checkpoint），进程重启后图执行状态会丢失（目前仅靠 SQLite 审批记录恢复审批 UI）。计划将 checkpoint 与记忆快照落到 Redis，实现服务崩溃或重启后从最近快照恢复，配合已有的 `interrupt` / `resume` 达成真正的断点续跑。
+- [ ] **生产级可观测与评测闭环** — 当前已有 Prometheus 基础指标与 RAG 评测脚手架，但尚未完整覆盖任务成功率、失败类型、TTFT、端到端延迟 p50/p95、API 成功率、吞吐与真实 token 成本。计划补齐运行时指标、失败类型 taxonomy、LangSmith trace，以及 Prompt / 检索方案 / 工具描述的消融实验框架，形成「线上监控、链路追踪、离线评测、实验对比」闭环。
+- [ ] **可视化多智能体手动编排** — 在现有 LangGraph Multi-Agent 基础上，引入 React Flow 画布与 Flow DSL，允许用户自定义 `AgentSpec`（角色、Prompt、模型、工具白名单、审批策略、输出格式），由后端安全执行器校验并编译为 LangGraph 执行；运行态通过 SSE 回填节点状态，复用现有 MCP 审批与 `interrupt` / `resume`。
 - [ ] **自进化：复杂方法沉淀为 Skill** — 当前 SKILL.md 由人工编写。计划让 Agent 从成功的复杂任务轨迹（Plan-and-Execute / Multi-Agent 的规划与执行过程）中自动提炼可复用解法，沉淀为新的 SKILL.md；下次遇到同类任务直接 `load_skill` 复用而非从零规划，形成「执行、反思、沉淀、复用」的自我进化闭环。
