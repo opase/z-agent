@@ -1,6 +1,7 @@
 """MCPServerManager — MCP 服务器生命周期管理"""
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
@@ -278,21 +279,24 @@ class MCPServerManager:
                 self.registry.mark_server_unavailable(server_name)
                 return f"[错误] MCP 服务器 '{server_name}' 重连异常: {e}"
 
-        try:
-            import time
-            from core import metrics
-            t0 = time.time()
-            if tool_name in info.get("virtual_resource_tools", ()):
-                result = await self._call_resource_tool(transport, tool_name, arguments)
-            else:
-                result = await transport.call_tool(tool_name, arguments)
-            metrics.mcp_tool_calls.labels(server=server_name, tool=tool_name).inc()
-            metrics.mcp_tool_duration.labels(server=server_name, tool=tool_name).observe(time.time() - t0)
-            return result
-        except Exception as e:
-            from core import metrics
-            metrics.mcp_tool_calls.labels(server=server_name, tool=tool_name).inc()
-            return f"[错误] MCP 工具调用失败: {e}"
+        # MCP 传输层 span（位于 agent/graph 的 tool.invoke 之下，分层观测）。
+        # except 分支吞异常返回字符串、不 re-raise，故用裸 span + record_error 显式标记失败。
+        from core import tracing
+        with tracing.get_tracer().start_as_current_span("mcp.tool.call") as mspan:
+            tracing.set_io(mspan, kind=tracing.KIND_TOOL,
+                           input_value=json.dumps(arguments, ensure_ascii=False, default=str))
+            mspan.set_attribute("mcp.tool", tool_name)
+            mspan.set_attribute("mcp.server", server_name)
+            try:
+                if tool_name in info.get("virtual_resource_tools", ()):
+                    result = await self._call_resource_tool(transport, tool_name, arguments)
+                else:
+                    result = await transport.call_tool(tool_name, arguments)
+                tracing.mark_success(mspan, output_value=result)
+                return result
+            except Exception as e:
+                tracing.record_error(mspan, "tool_error", e)
+                return f"[错误] MCP 工具调用失败: {e}"
 
     async def _call_resource_tool(self, transport, tool_name: str, arguments: dict) -> str:
         """执行 resource 虚拟工具（list_resources / read_resource）"""

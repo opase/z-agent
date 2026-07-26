@@ -3,7 +3,6 @@ import logging
 import os
 import tempfile
 from fastapi import APIRouter, UploadFile, File, Request
-from core import metrics
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
@@ -40,6 +39,4 @@ async def upload(file: UploadFile = File(...), request: Request = None):
             pass
 
     rag.sync_bm25()
-    metrics.knowledge_uploads.inc()
-    metrics.vector_doc_count.set(rag.bm25.doc_count)
     return {"msg": result, "filename": file.filename}

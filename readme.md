@@ -6,7 +6,7 @@
 ![ChromaDB](https://img.shields.io/badge/ChromaDB-vector-FF6F61)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP-6E56CF)
 
-Zagent 是一个基于 LangGraph 的 RAG 引擎：Agent 自己决定什么时候检索、用哪个工具、检索几次。用户请求经意图分类、多模态视觉理解、查询改写后，由条件路由分派到 ReAct、Plan-and-Execute、Multi-Agent 三种执行模式；工具调用通过 MCP 协议接入外部能力，受人机回圈门控；长会话由 MapReduce 异步压缩控制上下文膨胀；内置 Prometheus 可观测。
+Zagent 是一个基于 LangGraph 的 智能体：Agent 自己决定什么时候检索、用哪个工具、检索几次。用户请求经意图分类、多模态视觉理解、查询改写后，由条件路由分派到 ReAct、Plan-and-Execute、Multi-Agent 三种执行模式；工具调用通过 MCP 协议接入外部能力，受人机回圈门控；长会话由 MapReduce 异步压缩控制上下文膨胀；内置 OpenTelemetry / Phoenix 可观测。
 
 ---
 
@@ -98,10 +98,10 @@ Zagent 围绕 Agent 引擎和配套支撑设施展开，主要功能如下。
 - 稀疏检索（BM25）与稠密检索（向量）经 RRF 融合，再用重排模型排序。
 - 稀疏与稠密双路召回，兼顾关键词精准匹配与语义泛化。
 
-### Prometheus 可观测
+### Prometheus / Phoenix 可观测
 
-- 内置业务指标：对话、SSE 事件、LLM 耗时、工具调用、ReAct 轮数、审批、检索、MCP 连接、知识库等。
-- 通过 `/metrics` 自动暴露，配合请求追踪中间件实现全链路可观测。
+- 以 OpenTelemetry Trace 为主、Arize Phoenix 为后端：LangChain / FastAPI 自动埋点采集全部 LLM 调用的 token、HTTP 链路与延迟；手动骨架 span 补业务语义（`task.status` / `error.type` / `user.query`）。
+- LLM-as-Judge 语义成功率、TTFT 首字延迟、Prompt / 检索方案 / 工具描述消融标签写入 span，Phoenix 按 span 属性聚合，并通过自身 `/metrics` 端点暴露给 Prometheus 抓取。
 
 ---
 
@@ -148,7 +148,7 @@ flowchart TB
     VDB[(ChromaDB 向量库)]
     SQL[(SQLite · 会话 / 审批)]
     MCPS[MCP 服务器 · filesystem]
-    PROM[[Prometheus /metrics]]
+    OTEL[[Arize Phoenix / Prometheus]]
 
     FE --> API
     API --> CORE
@@ -165,8 +165,8 @@ flowchart TB
     C1 --> SQL
     C2 --> VDB
     C3 --> SQL
-    API -. 指标采集 .-> PROM
-    ENGINE -. 指标采集 .-> PROM
+    API -. span 上报 .-> OTEL
+    ENGINE -. span 上报 .-> OTEL
 ```
 
 ### 请求主流程
@@ -370,7 +370,10 @@ flowchart LR
 
 ## 可观测性与工程化
 
-- **Prometheus 指标**（`core/metrics.py`）：覆盖对话、SSE 事件、LLM 耗时、工具调用、ReAct 轮数、验证结果、审批、检索、MCP 连接、知识库等维度指标；由 `prometheus-fastapi-instrumentator` 自动暴露 `GET /metrics`。
+- **OpenTelemetry 追踪**（`core/tracing.py`）：以 Trace 驱动，`openinference-instrumentation-langchain` 自动拦截全部 LLM 调用点（含 token 采集），`opentelemetry-instrumentation-fastapi` 自动生成 HTTP server span；经 OTLP/HTTP 上报至 Arize Phoenix。
+- **手动骨架 span：** `z_agent.chat` 入口 + `tool.invoke` 咽喉点写入 `task.status` / `error.type` / `user.query`；`chat.ttft` 记首字延迟；HITL `interrupt` / `resume` 双段各包 `z_agent.chat`，以 `chat.resume` 标签区分首次请求与审批恢复。
+- **评测与消融：** LLM-as-Judge 语义成功率（`eval.semantic_*`）与 Prompt / 检索方案 / 工具描述消融标签（`experiment.id` / `prompt.version` / `retrieval.scheme` / `tool_desc.version`）写入 span，Phoenix 按属性聚合对比。
+- **Prometheus 兼容：** Phoenix 自身暴露 `/metrics` 供 Prometheus 抓取聚合告警，Python 侧无需为 Prometheus 写代码。
 - **请求追踪：** `X-Request-ID` 中间件与全链路耗时日志。
 - **持久化**（`core/session_store.py`）：SQLite（WAL + 外键）四张表 `sessions`、`messages`、`session_summary`、`approval_requests`；`MemoryStore` 抽象基类可替换为 Redis 或 Postgres。
 - **降级矩阵：** Embedding、Reranker、Planner、Verifier、Vision、MCP、记忆压缩均有明确兜底策略，单点失败不拖垮主链路。
@@ -386,7 +389,7 @@ flowchart LR
 | 检索 | ChromaDB、rank-bm25 |
 | 工具协议 | MCP |
 | 持久化 | SQLite |
-| 可观测 | Prometheus |
+| 可观测 | OpenTelemetry、Arize Phoenix |
 | 前端 | React、Vite、TypeScript、Tailwind CSS |
 | 测试 | pytest |
 
@@ -420,7 +423,7 @@ flowchart LR
 ├── retrieval/              # embedding / bm25 / vector (RRF) / reranker
 ├── memory/                 # conversation (MapReduce) / token_budget (循环内 token 压缩) / long_term / user_profile / query_rewriter
 ├── skill/                  # parser / registry / tool / buffer（SKILL.md 技能系统）
-├── core/                   # rag_service / knowledge_service / session_* / approval_store / metrics
+├── core/                   # rag_service / knowledge_service / session_* / approval_store / tracing
 ├── evaluation/             # RAG 评测（检索指标与 LLM-as-Judge）
 └── tests/                  # pytest（12 个文件、147 个用例）
 ```
@@ -434,6 +437,6 @@ flowchart LR
 - [ ] **知识库权限管理：RBAC + ABAC** — 当前知识库是全局单库、所有用户共享，无访问隔离。计划引入基于角色的访问控制（RBAC）与基于属性的访问控制（ABAC）：RBAC 管「谁能查询 / 上传 / 管理哪些知识库」，ABAC 按文档属性（部门、密级、标签等）做动态过滤与行级授权，支持多租户隔离。
 - [ ] **向量库迁移 Qdrant** — 当前使用 ChromaDB（本地持久化）。计划支持 Qdrant，获得水平扩展、payload 过滤检索与生产级运维能力；检索层已做抽象，可平滑切换后端。
 - [ ] **Redis 持久化 Checkpoint 与记忆** — 当前 LangGraph 使用 `MemorySaver`（内存 checkpoint），进程重启后图执行状态会丢失（目前仅靠 SQLite 审批记录恢复审批 UI）。计划将 checkpoint 与记忆快照落到 Redis，实现服务崩溃或重启后从最近快照恢复，配合已有的 `interrupt` / `resume` 达成真正的断点续跑。
-- [ ] **生产级可观测与评测闭环** — 当前已有 Prometheus 基础指标与 RAG 评测脚手架，但尚未完整覆盖任务成功率、失败类型、TTFT、端到端延迟 p50/p95、API 成功率、吞吐与真实 token 成本。计划补齐运行时指标、失败类型 taxonomy、LangSmith trace，以及 Prompt / 检索方案 / 工具描述的消融实验框架，形成「线上监控、链路追踪、离线评测、实验对比」闭环。
+- [x] **生产级可观测与评测闭环**（已实现）— 以 OpenTelemetry Trace + Arize Phoenix 为可观测后端，LangChain / FastAPI 自动埋点覆盖全部 LLM 调用点的 token 采集与 HTTP 链路；手动骨架 span 写入 `task.status` / `error.type` / `user.query` / TTFT 首字延迟，HITL `interrupt` / `resume` 双段均包 `z_agent.chat`；LLM-as-Judge 语义成功率与 Prompt / 检索方案 / 工具描述的消融标签（`experiment.id` 等）写入 span，Phoenix 按 span 属性聚合 p50/p95 延迟、token 成本与成功率，形成「线上监控、链路追踪、离线评测、实验对比」闭环。Prometheus 退为从 Phoenix `/metrics` 抓取。
 - [ ] **可视化多智能体手动编排** — 在现有 LangGraph Multi-Agent 基础上，引入 React Flow 画布与 Flow DSL，允许用户自定义 `AgentSpec`（角色、Prompt、模型、工具白名单、审批策略、输出格式），由后端安全执行器校验并编译为 LangGraph 执行；运行态通过 SSE 回填节点状态，复用现有 MCP 审批与 `interrupt` / `resume`。
 - [ ] **自进化：复杂方法沉淀为 Skill** — 当前 SKILL.md 由人工编写。计划让 Agent 从成功的复杂任务轨迹（Plan-and-Execute / Multi-Agent 的规划与执行过程）中自动提炼可复用解法，沉淀为新的 SKILL.md；下次遇到同类任务直接 `load_skill` 复用而非从零规划，形成「执行、反思、沉淀、复用」的自我进化闭环。

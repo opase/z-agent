@@ -45,13 +45,26 @@ session_mgr = SessionManager(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """应用生命周期：启动时连接 MCP，关闭时清理子进程"""
-    from core import metrics
+    from core import tracing
+    from opentelemetry import metrics as otel_metrics
+
+    # MCP 连接状态 Gauge（OTel Metrics API → OTLP → Phoenix /metrics）
+    # 经 ObservableGauge 回调周期性读取实时连接状态，供 Prometheus 告警。
+    meter = tracing.get_meter()
+
+    def _mcp_status(_options):
+        for server_name, ok in rag.mcp_manager.get_server_status().items():
+            yield otel_metrics.Observation(1 if ok else 0, {"server": server_name})
+
+    meter.create_observable_gauge(
+        "z_agent_mcp_connection_status",
+        callbacks=[_mcp_status],
+        description="MCP 服务器连接状态 (1=已连接, 0=断开)",
+    )
 
     # 启动
     logger.info("正在启动 MCP 服务器连接...")
     results = await rag.mcp_manager.start_all()
-    for server_name, ok in results.items():
-        metrics.mcp_connection_status.labels(server=server_name).set(1 if ok else 0)
     connected = sum(1 for v in results.values() if v)
     logger.info("MCP 启动完成: %d/%d 连接成功", connected, len(results))
 
@@ -59,9 +72,8 @@ async def lifespan(_app: FastAPI):
 
     # 关闭
     logger.info("正在关闭 MCP 服务器连接...")
-    for server_name in rag.mcp_manager.server_names:
-        metrics.mcp_connection_status.labels(server=server_name).set(0)
     await rag.mcp_manager.shutdown_all()
+    tracing.shutdown_tracing()  # 刷盘 in-flight span/metric
 
 
 app = FastAPI(title="Zagent", version="2.0.0", lifespan=lifespan)
@@ -72,12 +84,13 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Prometheus 指标暴露
-from prometheus_fastapi_instrumentator import Instrumentator
-Instrumentator(
-    should_group_status_codes=False,
-    should_ignore_untemplated=True,
-).instrument(app).expose(app)
+# OTel tracing 初始化（设 TracerProvider / MeterProvider + LangChain 自动 instrumentation）
+from core import tracing
+tracing.setup_tracing()
+# 注：不启用 FastAPIInstrumentor。它产生的 HTTP server span（POST /chat/stream 等）不带
+# OpenInference 的 kind/input/output，在 Phoenix 里是空行噪音，且会把 z_agent.chat 压成子 span、
+# 让 trace 列表顶层显示空。去掉后 z_agent.chat 成为 trace 根 span，Phoenix 顶层直接显示
+# 有值的 chat/LLM/tool 数据。若将来需要 HTTP 层埋点，再 instrument_app(app) 即可。
 
 
 # 请求追踪中间件

@@ -13,8 +13,11 @@ python-multipart>=0.0.27
 rank-bm25>=0.2.2
 jieba>=0.42.1
 mcp>=1.0.0
-prometheus_fastapi_instrumentator>=7.0.0
-prometheus_client>=0.21.0
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp>=1.27.0
+opentelemetry-instrumentation-fastapi>=0.48b0
+openinference-instrumentation-langchain>=0.1.29
 pyyaml>=6.0
 # ===== 可选：文档解析增强（取消注释以启用 PDF/DOCX/PPTX 导入）=====
 # 本地模式（需 GPU）: uv pip install "mineru[all]"

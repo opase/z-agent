@@ -6,9 +6,23 @@ from dataclasses import dataclass, field
 from memory.conversation import ConversationMemory, Message
 from core.session_store import MemoryStore, SessionStore
 from config import settings as config
-from core import metrics
+from core import tracing
 
 logger = logging.getLogger(__name__)
+
+
+# 活跃会话 Gauge（OTel Metrics API，经 OTLP 发给 Phoenix /metrics）。
+# 惰性创建：必须晚于 main.py 的 setup_tracing() 设置 MeterProvider，故延迟到首次使用。
+_active_sessions_counter = None
+
+
+def _active_sessions():
+    global _active_sessions_counter
+    if _active_sessions_counter is None:
+        _active_sessions_counter = tracing.get_meter().create_up_down_counter(
+            "z_agent_active_sessions", description="当前活跃会话数",
+        )
+    return _active_sessions_counter
 
 
 @dataclass
@@ -66,7 +80,7 @@ class SessionManager:
             self.store.touch_session(session_id, user_id)
         except Exception as e:
             logger.error("持久化会话失败: %s", e)
-        metrics.active_sessions.inc()
+        _active_sessions().add(1)
         return s
 
     def _restore_session(self, session_id: str, user_id: str) -> Session | None:
@@ -150,7 +164,7 @@ class SessionManager:
         """同步移除会话（内部使用：超时清理等）"""
         if session_id in self.sessions:
             self.sessions.pop(session_id, None)
-            metrics.active_sessions.dec()
+            _active_sessions().add(-1)
         try:
             self.store.delete_session(session_id)
         except Exception as e:
@@ -161,7 +175,7 @@ class SessionManager:
         existed = session_id in self.sessions
         session = self.sessions.pop(session_id, None)
         if existed:
-            metrics.active_sessions.dec()
+            _active_sessions().add(-1)
         if session and hasattr(session.memory, 'await_compression'):
             await session.memory.await_compression()
         try:

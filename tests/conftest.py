@@ -5,6 +5,16 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 测试隔离：在任何测试模块（及其 lazy import 的 main）加载前，把 tracing 初始化降级为 noop，
+# 避免单测向真实 Phoenix 导出 span/metric，并避开全局 TracerProvider/MeterProvider 单例。
+# OTel 未安装时 import 失败也无妨——setup_tracing 内部本就会降级。
+try:
+    import core.tracing as _tracing
+    _tracing.setup_tracing = lambda: None
+    _tracing.shutdown_tracing = lambda: None
+except Exception:
+    pass
+
 
 @pytest.fixture(scope="session")
 def config():

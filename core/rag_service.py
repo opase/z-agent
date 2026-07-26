@@ -11,7 +11,7 @@ from config import settings as config
 from core.container import (
     RetrievalServices, LLMProvider, MCPServices, VisionServices, MemoryServices,
 )
-from core import metrics
+from core import tracing
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,36 @@ class RagService:
         mode: str = "auto",
     ) -> dict:
         """主对话接口（异步），支持图片"""
-        metrics.chat_requests.labels(mode=mode, stream="false", has_image="true" if images else "false").inc()
+        thread_id = memory.session_id if memory and hasattr(memory, "session_id") else "default"
+        # root span：记录整轮对话，task.status 由 span() 在成功/失败时自动设置
+        with tracing.span(
+            "z_agent.chat",
+            **{
+                "user.query": tracing.sanitize_query(question),
+                "chat.mode": mode,
+                "chat.has_image": bool(images),
+                "chat.stream": False,
+                "chat.thread_id": thread_id,
+            },
+        ) as cspan:
+            tracing.set_io(cspan, kind=tracing.KIND_CHAIN, input_value=question)
+            tracing.set_ablation(cspan)
+            result = await self._run_chat(question, memory, user_id, images, mode)
+            # output.value：正常回答取 answer，中断/异常取 status 摘要
+            if isinstance(result, dict):
+                answer = result.get("answer") or ""
+                tracing.set_io(cspan, output_value=answer or result.get("status", ""))
+                if config.eval_semantic_enabled and answer.strip():
+                    await self._record_semantic_eval(
+                        cspan, question, answer, result.get("context", ""),
+                    )
+            return result
+
+    async def _run_chat(
+        self, question: str, memory: ConversationMemory = None,
+        user_id: str = "default", images: list[str] = None,
+        mode: str = "auto",
+    ) -> dict:
         long_mem = self._get_long_term(user_id)
         # Phase 3: 注入长期记忆供压缩时事实提取（仅首次）
         if memory and not memory._long_term_memory:
@@ -123,8 +152,8 @@ class RagService:
             "mode": mode,  # Phase 2: 从 API 传入，route_mode 自动判断（auto 时）
             "plan_result": "",
         }
-        config = {"configurable": {"thread_id": thread_id}}
-        result = await self.agent_graph.ainvoke(initial_state, config)
+        graph_config = {"configurable": {"thread_id": thread_id}}
+        result = await self.agent_graph.ainvoke(initial_state, graph_config)
 
         # LangGraph 1.x: interrupt() 后 ainvoke 返回带 __interrupt__ 键的状态
         if isinstance(result, dict) and "__interrupt__" in result:
@@ -158,15 +187,53 @@ class RagService:
         user_id: str = "default", images: list[str] = None,
         session_id: str = "", mode: str = "auto",
     ) -> AsyncGenerator[str, None]:
-        """流式对话接口 — 统一使用 astream_events() 支持三种执行模式
+        """流式对话接口 — 统一使用 astream_events() 支持三种执行模式"""
+        from opentelemetry import trace as _otel_trace
+        thread_id = session_id or "default"
+        # root span（流式）：用裸 span 手动管控 task.status，避免生成器内吞异常被误标成功
+        with tracing.get_tracer().start_as_current_span("z_agent.chat") as chat_span:
+            chat_span.set_attribute("user.query", tracing.sanitize_query(question))
+            chat_span.set_attribute("chat.mode", mode)
+            chat_span.set_attribute("chat.has_image", bool(images))
+            chat_span.set_attribute("chat.stream", True)
+            chat_span.set_attribute("chat.thread_id", thread_id)
+            tracing.set_io(chat_span, kind=tracing.KIND_CHAIN, input_value=question)
+            tracing.set_ablation(chat_span)
+            # TTFT 子 span：duration = 首字延迟，Phoenix 直接按 chat.ttft 聚合 p50/p95。
+            # 仅作计时标记，不设为 current span，故内部 LLM span 仍挂在 z_agent.chat 下。
+            ttft_span = tracing.get_tracer().start_span(
+                "chat.ttft", context=_otel_trace.set_span_in_context(chat_span),
+            )
+            ttft_span.set_attribute(tracing.SPAN_KIND, tracing.KIND_CHAIN)
+            ttft_span.set_attribute("chat.thread_id", thread_id)
+            _ttft_done = False
+            try:
+                async for chunk in self._run_chat_stream(
+                    question, memory, user_id, images, session_id, mode,
+                ):
+                    # 第一个答案 token 到达即结束 TTFT（进度事件 data:{...} / __CA_META__ 不是答案）
+                    if not _ttft_done and isinstance(chunk, str) and chunk \
+                            and not chunk.startswith("data:") and "__CA_META__" not in chunk:
+                        tracing.end_span(ttft_span, ok=True)
+                        _ttft_done = True
+                    yield chunk
+            finally:
+                # 审批中断 / 异常 / 无 token：未吐字即结束，留 note 不计成功也不计失败
+                if not _ttft_done:
+                    tracing.end_span(ttft_span, ok=False, note="no_token")
 
-        Phase 2c: 从手写 ReAct 循环迁移为 LangGraph astream_events() 驱动。
+    async def _run_chat_stream(
+        self, question: str, memory: ConversationMemory = None,
+        user_id: str = "default", images: list[str] = None,
+        session_id: str = "", mode: str = "auto",
+    ) -> AsyncGenerator[str, None]:
+        """Phase 2c 起：从手写 ReAct 循环迁移为 LangGraph astream_events() 驱动。
+
         - react / plan / multi_agent 模式均通过同一图执行
         - 自定义事件（plan_created, task_started 等）转为 SSE 进度事件
         - interrupt() 暂停图执行 → 产出审批 SSE 事件 → 等待用户决议
         - 图完成后流式输出最终回答
         """
-        metrics.chat_requests.labels(mode=mode, stream="true", has_image="true" if images else "false").inc()
         long_mem = self._get_long_term(user_id)
         # Phase 3: 注入长期记忆供压缩时事实提取
         if memory and not memory._long_term_memory:
@@ -191,7 +258,7 @@ class RagService:
             "mode": mode,       # 从 API 传入，route_mode 自动判断（auto 时）
             "plan_result": "",
         }
-        config = {"configurable": {"thread_id": thread_id}}
+        graph_config = {"configurable": {"thread_id": thread_id}}
 
         # ── Phase 1: 通过 astream_events 运行图，收集进度事件和中断 ──
         graph_result = None
@@ -200,7 +267,7 @@ class RagService:
 
         try:
             async for event in self.agent_graph.astream_events(
-                initial_state, config, version="v2",
+                initial_state, graph_config, version="v2",
             ):
                 kind = event.get("event", "")
 
@@ -212,10 +279,10 @@ class RagService:
                                 "task_failed", "plan_completed", "review_escalation",
                                 "approval_required",
                                 "thinking", "tool_call", "tool_result"):
-                        metrics.sse_events.labels(event_type=name).inc()
                         sse_evt = {"type": name, **data}
                         yield f"data: {json.dumps(sse_evt, ensure_ascii=False)}\n\n"
         except Exception as e:
+            tracing.record_error(tracing.current_span(), "stream_error", e)
             import traceback
             tb = traceback.format_exc()
             logger.error("astream_events 异常: %s\n%s", e, tb)
@@ -223,7 +290,7 @@ class RagService:
             return
 
         # ── Phase 2: 检查 LangGraph 中断（工具审批 / 计划审批 / 审查升级） ──
-        state_snapshot = await self.agent_graph.aget_state(config)
+        state_snapshot = await self.agent_graph.aget_state(graph_config)
 
         if state_snapshot and state_snapshot.interrupts:
             interrupt_list = state_snapshot.interrupts
@@ -244,6 +311,12 @@ class RagService:
                             "turn_count": memory.turn_count if memory else 1,
                         }, ensure_ascii=False)
                         yield f"\n__CA_META__{meta}__CA_META_END__"
+                        # interrupt 是正常暂停（等待审批），不是错误：收尾 span，
+                        # 否则 z_agent.chat 会 status=UNSET、无 output（Phoenix 显示空）。
+                        tracing.mark_success(
+                            tracing.current_span(),
+                            output_value=f"[已暂停等待审批: {evt_type}]",
+                        )
                         return
 
         # ── Phase 3: 图正常完成 → 提取结果 ──
@@ -304,6 +377,22 @@ class RagService:
             "sources": final_output.get("sources", []),
         }, ensure_ascii=False)
         yield f"\n__CA_META__{meta}__CA_META_END__"
+        tracing.mark_success(tracing.current_span(), output_value=full_answer)
+        if config.eval_semantic_enabled and full_answer.strip():
+            await self._record_semantic_eval(
+                tracing.current_span(), question, full_answer, context,
+            )
+
+    async def _record_semantic_eval(self, span_, question: str, answer: str, context: str = "") -> None:
+        """LLM-as-judge 语义评估，结果写入 span 的 eval.semantic_* 属性（供 Phoenix 聚合成功率）。"""
+        try:
+            from agent.semantic_eval import judge_answer
+            verdict = await judge_answer(self.light_llm, question, answer, context)
+            span_.set_attribute("eval.semantic_pass", verdict["pass"])
+            span_.set_attribute("eval.semantic_score", verdict["score"])
+            span_.set_attribute("eval.semantic_reason", verdict["reason"])
+        except Exception as e:
+            logger.warning("记录语义评估失败: %s", e)
 
 
     async def end_session(self, user_id: str, memory: ConversationMemory):

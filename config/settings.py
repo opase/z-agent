@@ -93,6 +93,39 @@ max_mcp_servers = int(os.getenv("MAX_MCP_SERVERS", "10"))
 # ==================== SSE 事件格式 ====================
 sse_structured_events = os.getenv("SSE_STRUCTURED_EVENTS", "true").lower() in ("1", "true", "yes")
 
+# ==================== OpenTelemetry / Phoenix 追踪 ====================
+# Phoenix 为主（Trace 驱动），Prometheus 为辅（聚合告警）。
+# Span 经 OTLP/HTTP 发往 Phoenix。
+otel_enabled = os.getenv("OTEL_ENABLED", "true").lower() in ("1", "true", "yes")
+otel_service_name = os.getenv("OTEL_SERVICE_NAME", "z-agent")
+otel_environment = os.getenv("OTEL_ENVIRONMENT", "development")
+# OTLP/HTTP 端点必须含路径：traces 用 /v1/traces，metrics 用 /v1/metrics
+phoenix_traces_endpoint = os.getenv("PHOENIX_TRACES_ENDPOINT", "http://localhost:6006/v1/traces")
+phoenix_metrics_endpoint = os.getenv("PHOENIX_METRICS_ENDPOINT", "http://localhost:6006/v1/metrics")
+phoenix_api_key = os.getenv("PHOENIX_API_KEY", "")  # Phoenix 云端/鉴权时填，留空不发 Authorization 头
+# 2 个瞬时 Gauge（active_sessions / mcp_connection_status）是否经 OTLP metrics 发送。
+# 默认关闭：旧版 Phoenix 仅支持 /v1/traces，不摄取 OTLP metrics（返回 405），
+# 会导致 PeriodicExportingMetricReader 每 10s 刷一条 ERROR 日志。
+# 启用条件（满足任一）：① 确认你的 Phoenix 版本支持 OTLP HTTP metrics 摄取；
+#                      ② 改用 OTel Collector 作为 metrics 后端（phoenix_metrics_endpoint 指向 Collector）。
+# 关闭时 Gauge 退化为 no-op（get_meter() 返回默认空 meter），traces 不受影响。
+otel_metrics_enabled = os.getenv("OTEL_METRICS_ENABLED", "false").lower() in ("1", "true", "yes")
+otel_debug_console = os.getenv("OTEL_DEBUG_CONSOLE", "false").lower() in ("1", "true", "yes")
+
+# ==================== 评估 / 消融实验（写入 span 属性，供 Phoenix 聚合对比）====================
+# 语义成功率评估：每轮对话额外调一次 light_llm 做 LLM-as-judge（pass/score/reason）。
+# 默认关闭——开启后每轮多一次 LLM 调用（有成本/延迟），仅在做成功率统计时打开。
+eval_semantic_enabled = os.getenv("EVAL_SEMANTIC_ENABLED", "false").lower() in ("1", "true", "yes")
+# 消融实验标签：改实验参数时改这些值，Phoenix 按属性 group-by 即可对比不同方案。
+# - experiment_id：本次实验标识（如 "prompt-v2-run3"）
+# - prompt_version：系统 prompt 版本
+# - retrieval_scheme：检索方案（hybrid / vector / bm25）
+# - tool_desc_version：工具描述版本
+experiment_id = os.getenv("EXPERIMENT_ID", "")
+prompt_version = os.getenv("PROMPT_VERSION", "default")
+retrieval_scheme = os.getenv("RETRIEVAL_SCHEME", "hybrid")
+tool_desc_version = os.getenv("TOOL_DESC_VERSION", "default")
+
 # ==================== Agent 执行限制 ====================
 max_react_iterations = int(os.getenv("MAX_REACT_ITERATIONS", "5"))       # ReAct 最大迭代轮数
 max_task_iterations = int(os.getenv("MAX_TASK_ITERATIONS", "5"))         # Plan 模式单任务最大迭代轮数

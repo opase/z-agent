@@ -1,7 +1,7 @@
 """LangGraph Agent 状态机编排 — ReAct 模式（含 HITL 审批 + MCP 集成）"""
 import logging
+import json
 import re
-import time
 import uuid
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -9,6 +9,7 @@ from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from config import settings as config
+from core import tracing
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +190,6 @@ async def _execute_tool(tool_call: dict, rag_service,
     """
     name = tool_call["name"]
     args = tool_call.get("args", {})
-    from core import metrics
-    metrics.tool_calls.labels(tool_name=name).inc()
     logger.info("ReAct 调用工具: %s(%s)", name, args)
 
     # HITL 审批检查（MCP 工具 + require_approval）
@@ -224,24 +223,38 @@ async def _execute_tool(tool_call: dict, rag_service,
                 logger.info("审批拒绝: %s", name)
                 return msg
 
-    try:
-        # 注册表分发：精确匹配 → 前缀匹配 → 未知工具
-        executor = _TOOL_EXECUTORS.get(name)
-        if executor is None:
-            # 前缀匹配（如 "mcp__filesystem__read_file" 匹配 "mcp__"）
-            for prefix, exec_fn in sorted(_TOOL_EXECUTORS.items(), key=lambda kv: len(kv[0]), reverse=True):
-                if name.startswith(prefix):
-                    executor = exec_fn
-                    break
+    # 工具咽喉点 span：覆盖所有 ReAct / plan / multi_agent 工具调用（含 MCP）。
+    # 用裸 span 手动管控 task.status —— except 分支吞异常返回字符串，不 re-raise，
+    # 故不能用 span() 助手（它会在正常退出时覆盖为 success）。
+    mcp_server = name.split("__", 2)[1] if name.startswith("mcp__") and name.count("__") >= 2 else None
+    with tracing.get_tracer().start_as_current_span("tool.invoke") as tspan:
+        tracing.set_io(tspan, kind=tracing.KIND_TOOL,
+                       input_value=json.dumps(args, ensure_ascii=False, default=str))
+        tspan.set_attribute("tool.name", name)
+        tspan.set_attribute("mcp.server", mcp_server)
+        try:
+            # 注册表分发：精确匹配 → 前缀匹配 → 未知工具
+            executor = _TOOL_EXECUTORS.get(name)
+            if executor is None:
+                # 前缀匹配（如 "mcp__filesystem__read_file" 匹配 "mcp__"）
+                for prefix, exec_fn in sorted(_TOOL_EXECUTORS.items(), key=lambda kv: len(kv[0]), reverse=True):
+                    if name.startswith(prefix):
+                        executor = exec_fn
+                        break
 
-        if executor is not None:
-            result = await executor(name, args, rag_service)
-        else:
-            return f"[错误] 未知工具: {name}"
-        return str(result)
-    except Exception as e:
-        logger.error("工具执行失败 %s: %s", name, e)
-        return f"[错误] 工具 {name} 执行失败: {e}"
+            if executor is not None:
+                result = await executor(name, args, rag_service)
+            else:
+                tracing.record_error(tspan, "tool_error")
+                return f"[错误] 未知工具: {name}"
+            tracing.mark_success(tspan, output_value=result)
+            return str(result)
+        except Exception as e:
+            logger.error("工具执行失败 %s: %s", name, e)
+            tracing.record_error(
+                tspan, "retrieval_error" if name == "search_knowledge" else "tool_error", e,
+            )
+            return f"[错误] 工具 {name} 执行失败: {e}"
 
 
 async def _emit_event(name: str, payload: dict) -> None:
@@ -338,14 +351,12 @@ def build_graph(rag_service):
         context_chunks: list[str] = []
 
         # ReAct 循环
-        from core import metrics
         from memory.token_budget import compact_react_messages
         for iteration in range(MAX_REACT_ITERATIONS):
             # 调用 LLM 前按需压缩上下文，避免工具返回累积撑爆窗口
             messages = await compact_react_messages(messages, rag_service.light_llm)
-            t_llm = time.time()
+            # LLM span（含 token.prompt/completion）由 LangChainInstrumentor 自动生成
             response: AIMessage = await llm_with_tools.ainvoke(messages)
-            metrics.llm_duration.labels(model=config.chat_model, node="react_generate").observe(time.time() - t_llm)
 
             if response.tool_calls:
                 # LLM 决定调用工具 → HITL 检查在 _execute_tool 内完成
@@ -377,7 +388,7 @@ def build_graph(rag_service):
                 logger.info("ReAct 第 %d 轮: 调用了 %d 个工具", iteration + 1, len(response.tool_calls))
             else:
                 # LLM 输出最终回答
-                metrics.react_iterations.observe(iteration + 1)
+                # react 迭代轮数由 Phoenix 从每条 z_agent.chat 下 LLM span 数派生
                 logger.info("ReAct 完成: 共 %d 轮, %d 次工具调用",
                             iteration + 1, len(context_chunks))
                 return {
@@ -466,14 +477,13 @@ def build_graph(rag_service):
 
     async def _verify(state: AgentState) -> dict:
         from agent.verifier import AnswerVerifier
-        from core import metrics
-        t0 = time.time()
-        result = await AnswerVerifier().averify(
-            state["question"], state["answer"], state.get("context", ""),
-            llm=rag_service.light_llm,
-        )
-        metrics.llm_duration.labels(model=config.classifier_model, node="verify").observe(time.time() - t0)
-        metrics.verification_results.labels(result="pass" if result.get("pass", True) else "fail").inc()
+        # 验证 span：LLM 调用由 LangChainInstrumentor 自动埋点（含 token），此处只记业务结论
+        with tracing.span("verification.check") as vspan:
+            result = await AnswerVerifier().averify(
+                state["question"], state["answer"], state.get("context", ""),
+                llm=rag_service.light_llm,
+            )
+            vspan.set_attribute("verification.pass", bool(result.get("pass", True)))
         return {"verification": result}
 
     def _output(state: AgentState) -> dict:

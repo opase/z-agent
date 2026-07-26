@@ -48,9 +48,6 @@ class ApprovalManager:
                 tool_name=tool_name, tool_args=tool_args, server_name=server_name,
                 expires_at=expires_at,
             )
-        # 指标: 审批创建
-        from core import metrics
-        metrics.approval_created.labels(tool_name=tool_name, server=server_name).inc()
         logger.info("审批请求已创建: id=%s tool=%s thread=%s user=%s",
                      approval_id, tool_name, thread_id, user_id)
         return approval_id
@@ -85,8 +82,6 @@ class ApprovalManager:
         updated = self._store.resolve(approval_id, decision, operator_id, reject_reason)
         if updated:
             logger.info("审批 %s → %s (by %s)", approval_id, decision, operator_id or user_id)
-            from core import metrics
-            metrics.approval_decisions.labels(decision=decision).inc()
             return {"success": True, "message": f"审批已{'通过' if decision == 'approved' else '拒绝'}", "current_status": decision}
         return {"success": False, "message": "审批状态更新失败", "current_status": "unknown"}
 
