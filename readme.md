@@ -100,8 +100,8 @@ Zagent 围绕 Agent 引擎和配套支撑设施展开，主要功能如下。
 
 ### Prometheus / Phoenix 可观测
 
-- 以 OpenTelemetry Trace 为主、Arize Phoenix 为后端：LangChain / FastAPI 自动埋点采集全部 LLM 调用的 token、HTTP 链路与延迟；手动骨架 span 补业务语义（`task.status` / `error.type` / `user.query`）。
-- LLM-as-Judge 语义成功率、TTFT 首字延迟、Prompt / 检索方案 / 工具描述消融标签写入 span，Phoenix 按 span 属性聚合，并通过自身 `/metrics` 端点暴露给 Prometheus 抓取。
+- 以 OpenTelemetry 为统一协议入口：应用将 traces / metrics 经 OTLP/HTTP 发送到 OpenTelemetry Collector。
+- Collector 将 tracing 转发到 Arize Phoenix；将 metrics 暴露给 Prometheus 抓取。logs 暂未接通，后续可在 Collector 上继续扩展。LLM-as-Judge 语义成功率、TTFT 首字延迟、Prompt / 检索方案 / 工具描述消融标签继续写入 span，由 Phoenix 按属性聚合。
 
 ---
 
@@ -370,10 +370,11 @@ flowchart LR
 
 ## 可观测性与工程化
 
-- **OpenTelemetry 追踪**（`core/tracing.py`）：以 Trace 驱动，`openinference-instrumentation-langchain` 自动拦截全部 LLM 调用点（含 token 采集），`opentelemetry-instrumentation-fastapi` 自动生成 HTTP server span；经 OTLP/HTTP 上报至 Arize Phoenix。
+- **OpenTelemetry 追踪**（`core/tracing.py`）：以 Trace 驱动，`openinference-instrumentation-langchain` 自动拦截全部 LLM 调用点（含 token 采集）；应用经 OTLP/HTTP 上报到 OpenTelemetry Collector，再由 Collector 转发至 Arize Phoenix。
 - **手动骨架 span：** `z_agent.chat` 入口 + `tool.invoke` 咽喉点写入 `task.status` / `error.type` / `user.query`；`chat.ttft` 记首字延迟；HITL `interrupt` / `resume` 双段各包 `z_agent.chat`，以 `chat.resume` 标签区分首次请求与审批恢复。
 - **评测与消融：** LLM-as-Judge 语义成功率（`eval.semantic_*`）与 Prompt / 检索方案 / 工具描述消融标签（`experiment.id` / `prompt.version` / `retrieval.scheme` / `tool_desc.version`）写入 span，Phoenix 按属性聚合对比。
-- **Prometheus 兼容：** Phoenix 自身暴露 `/metrics` 供 Prometheus 抓取聚合告警，Python 侧无需为 Prometheus 写代码。
+- **Prometheus 兼容：** 应用 metrics 经 OTLP 上报到 Collector，由 Collector 暴露 `/metrics` 供 Prometheus 抓取聚合告警。
+- **日志扩展位：** 当前应用日志仍走标准 `logging`，后续如需统一接入，可在 Collector 上补 logs pipeline 与对应后端。
 - **请求追踪：** `X-Request-ID` 中间件与全链路耗时日志。
 - **持久化**（`core/session_store.py`）：SQLite（WAL + 外键）四张表 `sessions`、`messages`、`session_summary`、`approval_requests`；`MemoryStore` 抽象基类可替换为 Redis 或 Postgres。
 - **降级矩阵：** Embedding、Reranker、Planner、Verifier、Vision、MCP、记忆压缩均有明确兜底策略，单点失败不拖垮主链路。

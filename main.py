@@ -48,7 +48,7 @@ async def lifespan(_app: FastAPI):
     from core import tracing
     from opentelemetry import metrics as otel_metrics
 
-    # MCP 连接状态 Gauge（OTel Metrics API → OTLP → Phoenix /metrics）
+    # MCP 连接状态 Gauge（OTel Metrics API → OTLP → Collector → Prometheus）
     # 经 ObservableGauge 回调周期性读取实时连接状态，供 Prometheus 告警。
     meter = tracing.get_meter()
 
@@ -84,7 +84,8 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# OTel tracing 初始化（设 TracerProvider / MeterProvider + LangChain 自动 instrumentation）
+# OTel tracing 初始化（设 TracerProvider / MeterProvider，并统一发往 Collector）
+# LangChain 自动 instrumentation 仍保留，用于捕获 LLM / chain spans。
 from core import tracing
 tracing.setup_tracing()
 # 注：不启用 FastAPIInstrumentor。它产生的 HTTP server span（POST /chat/stream 等）不带

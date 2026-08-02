@@ -1,21 +1,19 @@
-"""OpenTelemetry tracing/metrics → Arize Phoenix (OTLP/HTTP)。
+"""OpenTelemetry tracing/metrics → Collector → Phoenix/Prometheus。
 
-取代 core/metrics.py。Span/Metric 经 OTLP 发往 Phoenix；Phoenix 接收后自动聚合，
-并通过自身 /metrics 端点暴露 Prometheus 格式供抓取 —— Python 侧无需为 Prometheus 写任何代码。
+当前推荐架构：App 统一按 OTLP/HTTP 发送 traces / metrics 到 Collector；
+Collector 将 traces 转发到 Phoenix，将 metrics 暴露给 Prometheus 抓取。
 
-架构（Phoenix 为主、Prometheus 为辅）：
-- 零侵入自动埋点：LangChainInstrumentor 拦截全部 LLM 调用点（自动采集 token）；
-  FastAPIInstrumentor（在 main.py 注册）自动生成 HTTP server span。
-- 手动骨架 Span：仅在 Agent 入口（z_agent.chat）与工具咽喉点（tool.invoke）写业务语义
-  （task.status / error.type / user.query）。
-- OTel Metrics API：仅保留 2 个瞬时 Gauge（active_sessions / mcp_connection_status），
-  其余计数器由 Phoenix 从 span 派生。
+架构约束：
+- 零侵入自动埋点：LangChainInstrumentor 拦截全部 LLM 调用点（自动采集 token）。
+- 手动骨架 Span：仅在 Agent 入口（z_agent.chat）与工具咽喉点（tool.invoke）写业务语义。
+- OTel Metrics API：仅保留少量服务态指标（如 active_sessions / mcp_connection_status）。
 """
 import re
 import logging
 import functools
 import inspect
 from contextlib import contextmanager
+from urllib.parse import unquote
 
 from opentelemetry import trace, metrics
 from opentelemetry.trace import Status, StatusCode
@@ -129,7 +127,7 @@ def _patch_tongyi_usage_metadata() -> None:
 def setup_tracing() -> None:
     """初始化 TracerProvider / MeterProvider 并挂载 LangChain 自动 instrumentation。
 
-    幂等且绝不抛异常：缺 Phoenix 或 OTel 关闭时导出静默失败，业务不受影响。
+    幂等且绝不抛异常：OTel 不可用或 Collector 不可达时导出降级，业务不受影响。
     """
     global _PROVIDER_OK
     if _PROVIDER_OK or not config.otel_enabled:
@@ -141,48 +139,67 @@ def setup_tracing() -> None:
             "deployment.environment": config.otel_environment,
         })
 
-        # ── Traces ──
+        # ── Traces → Collector ──
         tp = TracerProvider(resource=resource)
         exporter = OTLPSpanExporter(
-            endpoint=config.phoenix_traces_endpoint,            # 必须含 /v1/traces 路径
-            headers=_auth_headers(),
+            endpoint=config.otel_traces_endpoint,
+            headers=_headers_for("traces"),
         )
         tp.add_span_processor(BatchSpanProcessor(exporter))
         if config.otel_debug_console:
             tp.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
         _set_provider_safe(trace.set_tracer_provider, tp)
 
-        # ── Metrics（2 个瞬时 Gauge 经 OTLP 发送，可选）──
-        # 旧版 Phoenix 不摄取 OTLP metrics（/v1/metrics 返回 405），默认关闭避免刷屏 ERROR；
-        # 关闭时 get_meter() 返回默认空 meter，UpDownCounter/ObservableGauge 退化为 no-op。
+        # ── Metrics → Collector（2 个瞬时 Gauge 经 OTLP 发送，可选）──
         if config.otel_metrics_enabled:
             mreader = PeriodicExportingMetricReader(
-                OTLPMetricExporter(endpoint=config.phoenix_metrics_endpoint, headers=_auth_headers()),
+                OTLPMetricExporter(endpoint=config.otel_metrics_endpoint, headers=_headers_for("metrics")),
                 export_interval_millis=10000,
             )
-            _set_provider_safe(metrics.set_meter_provider,
-                               MeterProvider(resource=resource, metric_readers=[mreader]))
-            logger.info("OTel metrics 已启用 → %s", config.phoenix_metrics_endpoint)
+            _set_provider_safe(
+                metrics.set_meter_provider,
+                MeterProvider(resource=resource, metric_readers=[mreader]),
+            )
+            logger.info("OTel metrics 已启用 → %s", config.otel_metrics_endpoint)
         else:
             logger.info("OTel metrics 未启用（OTEL_METRICS_ENABLED=false）；traces 照常工作，Gauge 退化为 no-op")
 
         # ── 自动 instrumentation：LangChain（覆盖全部 LLM 调用点 + token 采集）──
-        # FastAPI 自动埋点需访问 app 实例，由 main.py 在 app 创建后调用。
         from openinference.instrumentation.langchain import LangChainInstrumentor
         LangChainInstrumentor().instrument()
-        _patch_tracer_interrupt_hooks()  # 兜底 HITL interrupt/resume 回调缺口
-        _patch_tongyi_usage_metadata()   # 补 ChatTongyi usage_metadata，使 token 可被采集
+        _patch_tracer_interrupt_hooks()
+        _patch_tongyi_usage_metadata()
 
         _PROVIDER_OK = True
-        logger.info("OTel tracing 已启用 → %s", config.phoenix_traces_endpoint)
+        logger.info("OTel tracing 已启用 → %s", config.otel_traces_endpoint)
     except Exception as e:
-        # 监控降级，不影响业务
         logger.warning("OTel 初始化失败（监控降级，业务不受影响）: %s", e)
         _PROVIDER_OK = False
 
 
-def _auth_headers():
-    return {"authorization": f"Bearer {config.phoenix_api_key}"} if config.phoenix_api_key else None
+def _headers_for(signal: str):
+    raw = config.otel_exporter_otlp_headers
+    if signal == "traces" and config.otel_exporter_otlp_traces_headers:
+        raw = config.otel_exporter_otlp_traces_headers
+    elif signal == "metrics" and config.otel_exporter_otlp_metrics_headers:
+        raw = config.otel_exporter_otlp_metrics_headers
+    return _parse_headers(raw)
+
+
+def _parse_headers(raw: str):
+    if not raw:
+        return None
+    headers = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = unquote(value.strip())
+        if key:
+            headers[key] = value
+    return headers or None
 
 
 def _set_provider_safe(setter, provider) -> None:

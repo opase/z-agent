@@ -27,6 +27,7 @@ class TestRootEndpoints:
         assert data["status"] == "healthy"
         assert "bm25_docs" in data
         assert "active_sessions" in data
+        assert "mcp_servers" in data
 
     def test_request_id_header(self, client):
         resp = client.get("/")

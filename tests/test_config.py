@@ -1,5 +1,8 @@
 """测试配置模块"""
+import importlib
 import os
+
+import config.settings
 
 
 class TestConfig:
@@ -27,12 +30,40 @@ class TestConfig:
         assert config.session_timeout_hours == 24
 
     def test_env_override(self, monkeypatch):
-        import importlib
-        import config.settings
         monkeypatch.setenv("APP_PORT", "9090")
         importlib.reload(config.settings)
         from config import settings as cfg
         assert cfg.PORT == 9090
-        # restore
         monkeypatch.delenv("APP_PORT")
+        importlib.reload(config.settings)
+
+    def test_otlp_endpoint_defaults_to_collector_paths(self, monkeypatch):
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", raising=False)
+        importlib.reload(config.settings)
+        from config import settings as cfg
+        assert cfg.otel_traces_endpoint == "http://localhost:4318/v1/traces"
+        assert cfg.otel_metrics_endpoint == "http://localhost:4318/v1/metrics"
+
+    def test_otlp_base_endpoint_expands_per_signal_paths(self, monkeypatch):
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", raising=False)
+        importlib.reload(config.settings)
+        from config import settings as cfg
+        assert cfg.otel_traces_endpoint == "http://collector:4318/v1/traces"
+        assert cfg.otel_metrics_endpoint == "http://collector:4318/v1/metrics"
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+        importlib.reload(config.settings)
+
+    def test_signal_specific_endpoint_overrides_base_endpoint(self, monkeypatch):
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://collector:9999/custom/traces")
+        importlib.reload(config.settings)
+        from config import settings as cfg
+        assert cfg.otel_traces_endpoint == "http://collector:9999/custom/traces"
+        assert cfg.otel_metrics_endpoint == "http://collector:4318/v1/metrics"
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         importlib.reload(config.settings)

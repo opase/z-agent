@@ -1,0 +1,46 @@
+# OTel Collector —— Z-Agent 可观测性桥接（spanmetrics → Prometheus）
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318   # Python 发这里（OTLP/HTTP）
+      grpc:
+        endpoint: 0.0.0.0:4317   # 容器内监听，不映射到宿主（避免与 Phoenix 的 4317 冲突）
+
+connectors:
+  spanmetrics:
+    namespace: z_agent           # 指标前缀 → z_agent_calls_total / z_agent_duration
+    # 不加 dimensions —— Prometheus 只记录全局粗粒度状态。spanmetrics 默认维度
+    # （service_name / span_name / span_kind / status_code）已足够区分「请求 / 工具 /
+    # 验证 / LLM 调用」的次数、延迟与成功/失败。按业务维度（chat.mode / tool.name /
+    # verification.pass / 消融标签等）下钻分析归 Phoenix（trace 驱动，按 span 属性
+    # group-by）；保持低基数也避免 Prometheus 标签膨胀。
+    histogram:
+      explicit:
+        buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60]   # 秒
+
+exporters:
+  # 转发原始 traces 给 Phoenix（UI / span 查询 / token 详情都在这里看）
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006   # 容器网络内服务名；otlphttp 自动拼 /v1/traces
+    tls:
+      insecure: true
+  # spanmetrics 聚合出的指标 + Python 2 个 Gauge，统一暴露为 Prometheus 抓取格式
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true              # 把 service.name / deployment.environment 也作为指标 label
+    enable_open_metrics: true
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [spanmetrics, otlphttp/phoenix]   # 一份给 spanmetrics 聚合，一份转发 Phoenix
+    metrics:
+      receivers: [spanmetrics, otlp]   # spanmetrics 产的指标 + Python 直发的 Gauge
+      exporters: [prometheus]
